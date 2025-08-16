@@ -1,3 +1,4 @@
+# Include base requirements
 -r base.txt
 
 # Testing
@@ -5,20 +6,61 @@ pytest==7.4.3
 pytest-asyncio==0.21.1
 pytest-cov==4.1.0
 pytest-mock==3.12.0
-pytest-httpx==0.26.0
+pytest-xdist==3.5.0
+pytest-benchmark==4.0.0
+pytest-httpx==0.21.3
 pytest-postgresql==5.0.0
-faker==20.1.0
+pytest-redis==3.0.2
 
-# Development Tools
+# Testing Utilities
+factory-boy==3.3.0
+faker==20.1.0
+responses==0.24.1
+httpretty==1.1.4
+freezegun==1.2.2
+
+# Code Quality
 black==23.11.0
 isort==5.12.0
 flake8==6.1.0
 mypy==1.7.1
+pylint==3.0.3
+bandit==1.7.5
+
+# Pre-commit Hooks
 pre-commit==3.6.0
 
 # Documentation
+sphinx==7.2.6
+sphinx-autodoc-typehints==1.25.2
 mkdocs==1.5.3
 mkdocs-material==9.4.8
 
-# Debugging
-ipdb==0.13.13
+# Development Utilities
+ipython==8.18.1
+jupyter==1.0.0
+rich==13.7.0  # Beautiful terminal output
+click==8.1.7  # CLI utilities
+
+# Database Testing
+sqlalchemy-utils==0.41.1
+
+# Load Testing
+locust==2.17.0
+
+# API Testing
+tavern==2.4.2
+
+# Security Testing
+safety==2.3.4
+
+# Performance Profiling
+py-spy==0.3.14
+memory-profiler==0.61.0
+
+# Environment Management
+python-dotenv==1.0.0
+
+# Type Checking Extensions
+types-requests==2.31.0.10
+types-redis==4.6.0.11

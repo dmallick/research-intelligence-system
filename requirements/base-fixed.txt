@@ -1,0 +1,72 @@
+
+# Core Framework Dependencies - Conflict-Free Versions
+fastapi
+uvicorn[standard]
+#pydantic==2.5.0
+#pydantic-settings==2.1.0
+pydantic
+pydantic-settings
+
+
+# Database
+sqlalchemy
+alembic
+asyncpg
+psycopg2-binary
+
+# Redis & Message Queue
+redis
+aioredis
+
+# AI/ML Core - Compatible LangChain ecosystem
+#langchain-core==0.3.27  # Latest stable core
+langchain-core
+langchain
+langchain-openai
+langchain-community
+openai
+anthropic
+
+# CrewAI - will auto-resolve compatible versions
+crewai
+
+# Vector Database
+chromadb
+pinecone-client
+
+# Web Scraping & Document Processing
+playwright
+selenium
+beautifulsoup4
+requests
+aiohttp
+
+# Document Parsing
+pypdf2
+python-docx
+python-pptx
+openpyxl
+
+# Text Processing & NLP
+nltk
+spacy
+transformers
+sentence-transformers
+
+# Async & Concurrency
+celery
+
+# Utilities - Fixed httpx version
+python-dateutil
+python-multipart
+python-jose[cryptography]
+passlib[bcrypt]
+httpx  # Compatible with pytest-httpx
+
+# Logging & Monitoring
+structlog
+loguru
+
+# Validation & Parsing
+validators
+python-magic
