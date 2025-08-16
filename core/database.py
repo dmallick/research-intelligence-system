@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from contextlib import asynccontextmanager
 import logging
 from typing import AsyncGenerator
@@ -94,7 +94,8 @@ async def check_db_health() -> bool:
     """
     try:
         async with get_db() as db:
-            await db.execute("SELECT 1")
+            #await db.execute('SELECT 1')
+            await db.execute(text("SELECT 1"))
             return True
     except Exception as e:
         logging.error(f"Database health check failed: {e}")

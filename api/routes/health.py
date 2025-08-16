@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Dict
+from typing import Dict, Any
 import asyncio
 import time
 
@@ -20,7 +20,7 @@ async def health_check() -> Dict[str, str]:
     }
 
 @router.get("/detailed")
-async def detailed_health_check() -> Dict[str, any]:
+async def detailed_health_check() -> Dict[str, Any]:
     """Detailed health check including dependencies"""
     start_time = time.time()
     
