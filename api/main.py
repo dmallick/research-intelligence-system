@@ -3,14 +3,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import logging
-import time  # Missing import
+import time
 
 from core.config import settings
 from core.database import create_tables, close_db_connection
-# Import routes - these need to be created
-# from api.routes import research, health, agents
-from api.routes import research, health, agents
-
+from api.routes import  research, health, agents, messages, research_agent
 from utils.logging import setup_logging
 
 @asynccontextmanager
@@ -19,9 +16,7 @@ async def lifespan(app: FastAPI):
     setup_logging()
     await create_tables()
     logging.info("Application startup complete")
-    
     yield
-    
     # Shutdown
     await close_db_connection()
     logging.info("Application shutdown complete")
@@ -43,38 +38,18 @@ app.add_middleware(
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Basic health check endpoint (before routes are implemented)
-@app.get("/")
-async def root():
-    return {"message": "Research Intelligence System API", "status": "running"}
-
-@app.get("/health")
-async def health_check():
-    from core.database import check_db_health
-    
-    db_healthy = await check_db_health()
-    
-    return {
-        "status": "healthy" if db_healthy else "unhealthy",
-        "database": "connected" if db_healthy else "disconnected",
-        "version": "1.0.0"
-    }
-
-# Routes - uncomment when route files are created
-# app.include_router(health.router, prefix=settings.API_PREFIX)
-# app.include_router(research.router, prefix=settings.API_PREFIX)
-# app.include_router(agents.router, prefix=settings.API_PREFIX)
-
+# Routes
 app.include_router(health.router, prefix=settings.API_PREFIX)
-app.include_router(research.router, prefix=settings.API_PREFIX)
+app.include_router(research_agent.router, prefix=settings.API_PREFIX)
 app.include_router(agents.router, prefix=settings.API_PREFIX)
+app.include_router(messages.router, prefix=settings.API_PREFIX)
+app.include_router(research_agent.router, prefix=settings.API_PREFIX)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = time.time()
     response = await call_next(request)
     process_time = time.time() - start_time
-    
     logging.info(
         f"{request.method} {request.url} - "
         f"Status: {response.status_code} - "

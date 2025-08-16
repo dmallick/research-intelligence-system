@@ -270,7 +270,7 @@ class MessageQueue:
             self.logger.error(f"Redis health check failed: {e}")
             return False
 
-# Global message queue instance
+# Global message queue instances
 message_queue = MessageQueue()
 
 async def get_message_queue() -> MessageQueue:

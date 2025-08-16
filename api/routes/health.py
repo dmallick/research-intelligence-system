@@ -5,6 +5,7 @@ import asyncio
 import time
 
 from core.database import get_db, check_db_health
+from core.message_queue import get_message_queue
 from core.config import settings
 
 router = APIRouter(prefix="/health", tags=["health"])
@@ -27,8 +28,13 @@ async def detailed_health_check() -> Dict[str, Any]:
     # Check database
     db_healthy = await check_db_health()
     
-    # Check Redis (you can implement this later)
-    redis_healthy = True  # Placeholder
+    # Check Redis
+    redis_healthy = True
+    try:
+        mq = await get_message_queue()
+        redis_healthy = await mq.health_check()
+    except Exception as e:
+        redis_healthy = False
     
     # Check Vector Store (you can implement this later) 
     vector_store_healthy = True  # Placeholder
