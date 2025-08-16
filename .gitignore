@@ -205,3 +205,62 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Docker
+*.mo
+.dockerignore
+*.pot
+# Django stuff:
+# OS
+*.log
+.DS_Store
+local_settings.py
+Thumbs.db
+# Virtual Environment
+#  Usually these files are written by a python script from a template
+venv/
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+env/
+*.manifest
+ENV/
+*.spec
+# Installer logs
+# IDE
+pip-log.txt
+.vscode/
+pip-delete-this-directory.txt
+.idea/
+*.swp
+*.swo
+# Environment Variables
+.env
+.env.local
+.env.*.local
+# Database
+*.db
+*.sqlite3
+# Logs
+logs/
+*.log
+
+# Test Coverage
+htmlcov/
+.coverage
+.pytest_cache/
+# Docker
+.dockerignore
+# OS
+.DS_Store
+Thumbs.db
+# Project specific
+data/
+uploads/
+exports/
+models/cache/
+
+# Virtual Environment
+#  Usually these files are written by a python script from a template
+venv/
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+env/
+*.manifest
+ENV/

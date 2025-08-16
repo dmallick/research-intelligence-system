@@ -15,12 +15,13 @@ celery==5.3.4
 
 # Vector Database
 chromadb==0.4.18
-openai==1.3.7
 
-# Agent Framework
-langchain==0.0.350
-langchain-openai==0.0.2
-crewai==0.1.26
+# OpenAI and LangChain (compatible versions - let pip resolve)
+openai>=1.10.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.10
+langchain-core>=0.1.0
 
 # Web Scraping
 playwright==1.40.0
