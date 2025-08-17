@@ -1,104 +1,182 @@
+# scripts/test_agent.py
 import asyncio
+import sys
+import os
 from typing import Dict, Any
-from agents.base.agent import BaseAgent, AgentMessage
+from datetime import datetime, timezone
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+#from agents.base import BaseAgent
+from agents.base.agent import BaseAgent
+
+from core.message_queue import Message
+
 
 class TestAgent(BaseAgent):
-    """Simple test agent to verify message queue functionality"""
+    """Test agent for development and testing purposes"""
     
-    def __init__(self, agent_id: str = None):
-        super().__init__("test", agent_id)
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id, agent_type="test")
+        self.task_count = 0
+        self.received_messages = []
+        
+        # Register custom handlers
+        self._message_handlers.update({
+            "test_task": self._handle_test_task,
+            "echo": self._handle_echo,
+        })
     
-    async def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a test task"""
-        self.logger.info(f"Processing test task: {task}")
+    async def execute_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a test task"""
+        self.task_count += 1
         
-        # Simulate some work
-        await asyncio.sleep(2)
+        task_type = task.get("type", "unknown")
         
-        result = {
-            "status": "completed",
-            "task_id": task.get("task_id"),
-            "result": f"Test task completed by {self.agent_id}",
-            "processed_at": str(asyncio.get_event_loop().time())
-        }
+        if task_type == "simple_test":
+            result = {
+                "task_id": task.get("task_id", "unknown"),
+                "status": "completed",
+                "result": f"Test task executed by {self.agent_id}",
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "task_count": self.task_count
+            }
+        elif task_type == "echo":
+            result = {
+                "task_id": task.get("task_id", "unknown"),
+                "status": "completed",
+                "echo_data": task.get("data", {}),
+                "processed_at": datetime.now(timezone.utc).isoformat()
+            }
+        else:
+            result = {
+                "task_id": task.get("task_id", "unknown"),
+                "status": "error",
+                "error": f"Unknown task type: {task_type}",
+                "processed_at": datetime.now(timezone.utc).isoformat()
+            }
         
+        self.logger.info(f"Executed task {task.get('task_id')}: {result['status']}")
         return result
     
-    async def _handle_message(self, message: AgentMessage):
-        """Handle incoming message"""
-        self.logger.info(f"Received message from {message.sender_id}: {message.message_type}")
-        
-        if message.message_type == "ping":
-            # Respond to ping with pong
-            await self.send_message(
-                message.sender_id,
-                "pong",
-                {"original_message_id": message.id, "response": "Hello back!"},
-                correlation_id=message.correlation_id
-            )
-        
-        elif message.message_type == "test_task":
-            # Handle test task message
-            task_data = message.content
-            result = await self.process_task(task_data)
+    async def get_status(self) -> Dict[str, Any]:
+        """Get current test agent status"""
+        return {
+            "tasks_executed": self.task_count,
+            "messages_received": len(self.received_messages),
+            "last_message": self.received_messages[-1] if self.received_messages else None,
+            "capabilities": ["test_task", "echo", "ping", "pong"]
+        }
+    
+    async def _handle_test_task(self, message: Message):
+        """Handle test task messages"""
+        try:
+            task_data = message.payload
+            self.logger.info(f"Received test task from {message.from_agent}: {task_data}")
             
-            # Send result back
+            # Execute the task
+            result = await self.execute_task(task_data)
+            
+            # Send response back
             await self.send_message(
-                message.sender_id,
+                message.from_agent,
                 "task_result",
-                result,
+                {
+                    "original_task": task_data,
+                    "result": result,
+                    "processed_by": self.agent_id
+                },
                 correlation_id=message.correlation_id
             )
+            
+        except Exception as e:
+            self.logger.error(f"Error handling test task: {e}")
+            
+            # Send error response
+            await self.send_message(
+                message.from_agent,
+                "task_error",
+                {
+                    "original_task": message.payload,
+                    "error": str(e),
+                    "processed_by": self.agent_id
+                },
+                correlation_id=message.correlation_id
+            )
+    
+    async def _handle_echo(self, message: Message):
+        """Handle echo messages"""
+        echo_response = {
+            "original_message": message.payload,
+            "echo_from": self.agent_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
         
-        else:
-            self.logger.info(f"Unknown message type: {message.message_type}")
-
-# Test functions for manual testing
-async def test_message_queue():
-    """Test message queue functionality"""
-    print("Starting message queue test...")
+        await self.send_message(
+            message.from_agent,
+            "echo_response",
+            echo_response,
+            correlation_id=message.correlation_id
+        )
+        
+        self.logger.info(f"Echoed message back to {message.from_agent}")
     
-    # Create two test agents
-    agent1 = TestAgent("test_agent_1")
-    agent2 = TestAgent("test_agent_2")
+    async def handle_custom_message(self, message: Message):
+        """Handle any custom messages not covered by registered handlers"""
+        self.received_messages.append({
+            "message_type": message.message_type,
+            "from_agent": message.from_agent,
+            "timestamp": message.created_at.isoformat(),
+            "payload": message.payload
+        })
+        
+        self.logger.info(f"Received custom message: {message.message_type} from {message.from_agent}")
+        
+        # If it's a task_result or task_error, just log it
+        if message.message_type in ["task_result", "task_error"]:
+            result_status = message.payload.get("result", {}).get("status", "unknown")
+            self.logger.info(f"Task result received: {result_status}")
+        
+        # For unhandled message types, send an acknowledgment
+        elif message.message_type not in ["pong", "heartbeat", "status_response"]:
+            await self.send_message(
+                message.from_agent,
+                "message_ack",
+                {
+                    "ack_for": message.message_type,
+                    "message_id": message.id,
+                    "received_by": self.agent_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                },
+                correlation_id=message.correlation_id
+            )
     
-    # Initialize agents
-    await agent1.initialize()
-    await agent2.initialize()
+    async def send_test_ping(self, target_agent: str):
+        """Send a test ping to another agent"""
+        await self.send_message(
+            target_agent,
+            "ping",
+            {
+                "ping_from": self.agent_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "test_data": {"value": 42, "message": "Hello from test agent!"}
+            },
+            correlation_id=f"ping_{self.agent_id}_{target_agent}"
+        )
     
-    print("Agents initialized...")
+    async def send_test_task(self, target_agent: str, task_data: Dict[str, Any]):
+        """Send a test task to another agent"""
+        await self.send_message(
+            target_agent,
+            "test_task",
+            task_data,
+            correlation_id=f"task_{task_data.get('task_id', 'unknown')}"
+        )
     
-    # Agent 1 sends ping to Agent 2
-    await agent1.send_message(
-        "test_agent_2",
-        "ping", 
-        {"message": "Hello Agent 2!"},
-        correlation_id="test_correlation_123"
-    )
+    async def get_message_history(self) -> list:
+        """Get the history of received messages"""
+        return self.received_messages.copy()
     
-    print("Message sent...")
-    
-    # Wait a bit for message processing
-    await asyncio.sleep(3)
-    
-    # Send a test task
-    await agent1.send_message(
-        "test_agent_2",
-        "test_task",
-        {
-            "task_id": "test_task_001",
-            "task_type": "simple_test",
-            "data": {"value": 42}
-        },
-        correlation_id="task_test_456"
-    )
-    
-    print("Task sent...")
-    
-    # Wait for processing
-    await asyncio.sleep(5)
-    
-    print("Test completed!")
-
-if __name__ == "__main__":
-    asyncio.run(test_message_queue())
+    async def clear_message_history(self):
+        """Clear the message history"""
+        self.received_messages.clear()
+        self.logger.info("Message history cleared")

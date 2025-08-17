@@ -1,42 +1,47 @@
 #!/usr/bin/env python3
 """
 Test script for Research Agent
-Run this to test the research agent functionality
+Tests all research capabilities including web scraping, arXiv search, and document parsing
 """
 
 import asyncio
 import sys
 import os
+import tempfile
 import json
+from pathlib import Path
 
 # Add the project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agents.base.agent import BaseAgent
 
-from agents.research.research_agent import ResearchAgent
+
+from agents.research.research_agent import ResearchAgent, ResearchTaskTemplates
 from core.message_queue import get_message_queue
 import logging
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 async def test_research_agent_initialization():
     """Test research agent initialization"""
     print("=== Testing Research Agent Initialization ===")
     
     try:
-        agent = ResearchAgent("research_test_001")
+        # Create research agent
+        agent = ResearchAgent("test_research_agent")
         await agent.initialize()
-        await agent.initialize_browser()
+        
         print("✅ Research agent initialized successfully")
         
-        # Test health check
-        await agent.send_message(
-            "research_test_001",  # Send to self for testing
-            "ping",
-            {"test": "health_check"}
-        )
+        # Check status
+        status = await agent.get_status()
+        print(f"✅ Agent status retrieved: {status['capabilities']}")
         
-        await asyncio.sleep(1)
+        # Check statistics
+        stats = status.get('statistics', {})
+        print(f"✅ Agent statistics: {stats['total_requests']} total requests")
         
         return agent
         
@@ -44,302 +49,430 @@ async def test_research_agent_initialization():
         print(f"❌ Research agent initialization failed: {e}")
         return None
 
-async def test_web_research_task(agent: ResearchAgent):
-    """Test web research functionality"""
-    print("\n=== Testing Web Research Task ===")
+async def test_web_scraping(agent: ResearchAgent):
+    """Test web scraping functionality"""
+    print("\n=== Testing Web Scraping ===")
     
-    try:
-        task = {
-            "task_id": "web_research_001",
-            "task_type": "web_research",
-            "query": {
-                "query": "artificial intelligence recent developments",
-                "search_type": "web",
-                "max_results": 3
-            }
-        }
-        
-        print(f"Processing web research task: {task['query']['query']}")
-        result = await agent.process_task(task)
-        
-        if result["status"] == "completed":
-            print(f"✅ Web research completed")
-            print(f"   Results found: {result['results_found']}")
-            for i, res in enumerate(result['results'][:2]):  # Show first 2
-                print(f"   Result {i+1}: {res['title'][:60]}...")
-        else:
-            print(f"❌ Web research failed: {result.get('error', 'Unknown error')}")
-        
-        return result["status"] == "completed"
-        
-    except Exception as e:
-        print(f"❌ Web research test failed: {e}")
-        return False
+    # Test URLs (using reliable, simple sites)
+    test_urls = [
+        "https://httpbin.org/html",  # Simple HTML for testing
+        "https://jsonplaceholder.typicode.com/posts/1",  # JSON API
+        "https://example.com",  # Basic HTML
+    ]
+    
+    results = []
+    
+    for url in test_urls:
+        try:
+            print(f"📄 Scraping: {url}")
+            
+            # Create web scrape task
+            task = ResearchTaskTemplates.web_scrape_task(url)
+            task["task_id"] = f"scrape_{url.split('//')[-1].replace('/', '_')}"
+            
+            # Execute task
+            result = await agent.execute_task(task)
+            
+            if result["status"] == "completed":
+                content_length = len(result["result"].get("text_content", ""))
+                print(f"✅ Scraped successfully - {content_length} characters")
+                results.append(result)
+            else:
+                print(f"❌ Scraping failed: {result.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            print(f"❌ Error scraping {url}: {e}")
+    
+    print(f"📊 Web scraping completed: {len(results)}/{len(test_urls)} successful")
+    return results
 
-async def test_academic_search(agent: ResearchAgent):
-    """Test academic paper search"""
-    print("\n=== Testing Academic Search ===")
+async def test_arxiv_search(agent: ResearchAgent):
+    """Test arXiv search functionality"""
+    print("\n=== Testing arXiv Search ===")
     
     try:
-        task = {
-            "task_id": "academic_001",
-            "task_type": "academic_search",
-            "query": "machine learning transformers",
-            "max_results": 5
-        }
+        # Search for machine learning papers
+        query = "machine learning"
+        print(f"🔍 Searching arXiv for: {query}")
         
-        print(f"Searching for academic papers: {task['query']}")
-        result = await agent.process_task(task)
+        task = ResearchTaskTemplates.arxiv_search_task(query, max_results=5)
+        task["task_id"] = "arxiv_ml_search"
+        
+        result = await agent.execute_task(task)
         
         if result["status"] == "completed":
-            print(f"✅ Academic search completed")
-            print(f"   Papers found: {result['results_found']}")
-            for i, paper in enumerate(result['results'][:2]):  # Show first 2
-                print(f"   Paper {i+1}: {paper['title'][:60]}...")
-                print(f"            Authors: {', '.join(paper['authors'][:3])}")
+            papers = result["result"]
+            print(f"✅ Found {len(papers)} papers")
+            
+            for i, paper in enumerate(papers[:3], 1):  # Show first 3
+                print(f"  {i}. {paper.get('title', 'No title')[:100]}...")
+                print(f"     Authors: {', '.join(paper.get('authors', [])[:3])}")
+                print(f"     arXiv ID: {paper.get('arxiv_id', 'N/A')}")
+                print()
+            
+            return result
         else:
-            print(f"❌ Academic search failed: {result.get('error', 'Unknown error')}")
-        
-        return result["status"] == "completed"
-        
+            print(f"❌ arXiv search failed: {result.get('error', 'Unknown error')}")
+            return None
+            
     except Exception as e:
-        print(f"❌ Academic search test failed: {e}")
-        return False
+        print(f"❌ Error in arXiv search: {e}")
+        return None
 
 async def test_news_search(agent: ResearchAgent):
-    """Test news search functionality"""
+    """Test news search functionality (requires API key)"""
     print("\n=== Testing News Search ===")
     
     try:
-        task = {
-            "task_id": "news_001",
-            "task_type": "news_search",
-            "query": "technology news",
-            "max_results": 10,
-            "sources": [
-                "https://rss.cnn.com/rss/edition.rss",
-                "https://feeds.bbci.co.uk/news/technology/rss.xml"
-            ]
-        }
+        query = "artificial intelligence"
+        print(f"📰 Searching news for: {query}")
         
-        print(f"Searching news for: {task['query']}")
-        result = await agent.process_task(task)
+        task = ResearchTaskTemplates.news_search_task(query, max_results=5)
+        task["task_id"] = "news_ai_search"
+        
+        result = await agent.execute_task(task)
         
         if result["status"] == "completed":
-            print(f"✅ News search completed")
-            print(f"   Articles found: {result['results_found']}")
-            print(f"   Sources checked: {result['metadata']['sources_checked']}")
-            for i, article in enumerate(result['results'][:2]):  # Show first 2
-                print(f"   Article {i+1}: {article['title'][:60]}...")
+            articles = result["result"]
+            print(f"✅ Found {len(articles)} articles")
+            
+            for i, article in enumerate(articles[:3], 1):  # Show first 3
+                print(f"  {i}. {article.get('title', 'No title')[:100]}...")
+                print(f"     Source: {article.get('source', 'N/A')}")
+                print(f"     Published: {article.get('published_at', 'N/A')}")
+                print()
+            
+            return result
         else:
-            print(f"❌ News search failed: {result.get('error', 'Unknown error')}")
-        
-        return result["status"] == "completed"
-        
+            error_msg = result.get('error', 'Unknown error')
+            if "News API key not configured" in error_msg:
+                print("⚠️  News API key not configured - skipping news search test")
+                return {"status": "skipped", "reason": "No API key"}
+            else:
+                print(f"❌ News search failed: {error_msg}")
+                return None
+                
     except Exception as e:
-        print(f"❌ News search test failed: {e}")
-        return False
+        print(f"❌ Error in news search: {e}")
+        return None
 
-async def test_url_analysis(agent: ResearchAgent):
-    """Test URL analysis functionality"""
-    print("\n=== Testing URL Analysis ===")
+async def test_document_parsing(agent: ResearchAgent):
+    """Test document parsing functionality"""
+    print("\n=== Testing Document Parsing ===")
+    
+    results = []
+    
+    # Create temporary test files
+    temp_dir = Path(tempfile.mkdtemp())
     
     try:
-        # Test with a reliable URL
-        task = {
-            "task_id": "url_analysis_001",
-            "task_type": "url_analysis",
-            "url": "https://httpbin.org/html"  # Reliable test URL
-        }
+        # Test text file
+        text_file = temp_dir / "test.txt"
+        with open(text_file, 'w') as f:
+            f.write("This is a test text file.\nIt has multiple lines.\nFor testing document parsing.")
         
-        print(f"Analyzing URL: {task['url']}")
-        result = await agent.process_task(task)
+        print(f"📄 Parsing text file: {text_file}")
+        task = ResearchTaskTemplates.document_parse_task(str(text_file))
+        task["task_id"] = "parse_text"
         
+        result = await agent.execute_task(task)
         if result["status"] == "completed":
-            print(f"✅ URL analysis completed")
-            analysis = result["analysis"]
-            print(f"   Title: {analysis['title']}")
-            print(f"   Word count: {analysis['word_count']}")
-            print(f"   Quality score: {analysis['quality_score']:.2f}")
+            content_length = len(result["result"]["content"])
+            print(f"✅ Text file parsed successfully - {content_length} characters")
+            results.append(result)
         else:
-            print(f"❌ URL analysis failed: {result.get('error', 'Unknown error')}")
+            print(f"❌ Text parsing failed: {result.get('error')}")
         
-        return result["status"] == "completed"
-        
-    except Exception as e:
-        print(f"❌ URL analysis test failed: {e}")
-        return False
-
-async def test_message_communication(agent: ResearchAgent):
-    """Test message-based research requests"""
-    print("\n=== Testing Message Communication ===")
-    
-    try:
-        # Simulate a research request via message
-        from agents.base.agent import AgentMessage
-        from datetime import datetime
-        import uuid
-        
-        message = AgentMessage(
-            id=str(uuid.uuid4()),
-            sender_id="test_orchestrator",
-            receiver_id=agent.agent_id,
-            message_type="research_request",
-            content={
-                "task_id": "msg_research_001",
-                "task_type": "academic_search",
-                "query": "natural language processing",
-                "max_results": 3
-            },
-            timestamp=datetime.utcnow(),
-            correlation_id="test_correlation_msg"
-        )
-        
-        # Send message and wait for response
-        await agent._handle_message(message)
-        
-        # Wait for processing
-        await asyncio.sleep(2)
-        
-        print("✅ Message communication test completed")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Message communication test failed: {e}")
-        return False
-
-async def test_concurrent_requests(agent: ResearchAgent):
-    """Test concurrent request handling"""
-    print("\n=== Testing Concurrent Requests ===")
-    
-    try:
-        tasks = [
-            {
-                "task_id": f"concurrent_{i}",
-                "task_type": "academic_search",
-                "query": f"test query {i}",
-                "max_results": 2
+        # Test JSON file
+        json_file = temp_dir / "test.json"
+        test_data = {
+            "title": "Test Document",
+            "content": ["Item 1", "Item 2", "Item 3"],
+            "metadata": {
+                "created": "2024-01-01",
+                "version": "1.0"
             }
-            for i in range(3)
+        }
+        
+        with open(json_file, 'w') as f:
+            json.dump(test_data, f, indent=2)
+        
+        print(f"📄 Parsing JSON file: {json_file}")
+        task = ResearchTaskTemplates.document_parse_task(str(json_file))
+        task["task_id"] = "parse_json"
+        
+        result = await agent.execute_task(task)
+        if result["status"] == "completed":
+            items_count = result["result"]["metadata"]["items_count"]
+            print(f"✅ JSON file parsed successfully - {items_count} items")
+            results.append(result)
+        else:
+            print(f"❌ JSON parsing failed: {result.get('error')}")
+        
+        # Test HTML file
+        html_file = temp_dir / "test.html"
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Test HTML Document</title>
+        </head>
+        <body>
+            <h1>Test Document</h1>
+            <p>This is a test HTML document for parsing.</p>
+            <ul>
+                <li>Item 1</li>
+                <li>Item 2</li>
+                <li>Item 3</li>
+            </ul>
+        </body>
+        </html>
+        """
+        
+        with open(html_file, 'w') as f:
+            f.write(html_content)
+        
+        print(f"📄 Parsing HTML file: {html_file}")
+        task = ResearchTaskTemplates.document_parse_task(str(html_file))
+        task["task_id"] = "parse_html"
+        
+        result = await agent.execute_task(task)
+        if result["status"] == "completed":
+            title = result["result"]["metadata"]["title"]
+            print(f"✅ HTML file parsed successfully - Title: '{title}'")
+            results.append(result)
+        else:
+            print(f"❌ HTML parsing failed: {result.get('error')}")
+        
+    except Exception as e:
+        print(f"❌ Error in document parsing tests: {e}")
+    
+    finally:
+        # Cleanup temporary files
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    print(f"📊 Document parsing completed: {len(results)} successful")
+    return results
+
+async def test_batch_url_extraction(agent: ResearchAgent):
+    """Test batch URL extraction"""
+    print("\n=== Testing Batch URL Extraction ===")
+    
+    try:
+        urls = [
+            "https://httpbin.org/html",
+            "https://example.com",
+            "https://httpbin.org/json"
         ]
         
-        print("Processing 3 concurrent research tasks...")
-        results = await asyncio.gather(
-            *[agent.process_task(task) for task in tasks],
-            return_exceptions=True
-        )
+        print(f"📦 Extracting content from {len(urls)} URLs...")
         
-        completed = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "completed")
-        print(f"✅ Completed {completed}/3 concurrent tasks")
+        task = ResearchTaskTemplates.batch_url_extract_task(urls)
+        task["task_id"] = "batch_extract"
         
-        return completed >= 2  # At least 2 should succeed
+        result = await agent.execute_task(task)
         
+        if result["status"] == "completed":
+            results = result["result"]
+            successful = len([r for r in results if r["status"] == "success"])
+            print(f"✅ Batch extraction completed: {successful}/{len(urls)} successful")
+            
+            for i, url_result in enumerate(results, 1):
+                status = "✅" if url_result["status"] == "success" else "❌"
+                url = url_result["url"]
+                print(f"  {i}. {status} {url}")
+            
+            return result
+        else:
+            print(f"❌ Batch extraction failed: {result.get('error')}")
+            return None
+            
     except Exception as e:
-        print(f"❌ Concurrent requests test failed: {e}")
-        return False
+        print(f"❌ Error in batch URL extraction: {e}")
+        return None
 
-async def test_error_handling(agent: ResearchAgent):
-    """Test error handling with invalid tasks"""
-    print("\n=== Testing Error Handling ===")
+async def test_message_queue_integration(agent: ResearchAgent):
+    """Test message queue integration"""
+    print("\n=== Testing Message Queue Integration ===")
     
     try:
-        # Test invalid task type
-        invalid_task = {
-            "task_id": "invalid_001",
-            "task_type": "invalid_task_type",
-            "query": "test"
-        }
+        # Test sending a research task via message queue
+        print("📨 Testing message-based research task...")
         
-        result = await agent.process_task(invalid_task)
+        # Create a simple test agent to send messages
+        from scripts.test_agent import TestAgent
+        test_agent = TestAgent("test_requester")
+        await test_agent.initialize()
         
-        if result["status"] == "error" and "Unknown task type" in result["error"]:
-            print("✅ Error handling for invalid task type works")
-            return True
+        # Send a web scraping request
+        await test_agent.send_message(
+            agent.agent_id,
+            "web_scrape",
+            {
+                "url": "https://httpbin.org/html",
+                "options": {"use_playwright": False}
+            },
+            correlation_id="test_scrape_001"
+        )
+        
+        print("✅ Research task message sent")
+        
+        # Wait for response
+        await asyncio.sleep(3)
+        
+        # Check message history
+        history = await test_agent.get_message_history()
+        research_responses = [msg for msg in history if msg["message_type"] in ["scrape_result", "scrape_error"]]
+        
+        if research_responses:
+            response = research_responses[-1]  # Get latest response
+            if response["message_type"] == "scrape_result":
+                print("✅ Received successful scrape result via message queue")
+                return True
+            else:
+                print(f"❌ Received error response: {response.get('payload', {}).get('error')}")
+                return False
         else:
-            print(f"❌ Expected error handling failed: {result}")
+            print("⚠️  No response received from research agent")
             return False
-        
+            
     except Exception as e:
-        print(f"❌ Error handling test failed: {e}")
+        print(f"❌ Message queue integration test failed: {e}")
         return False
 
-async def cleanup_agent(agent: ResearchAgent):
-    """Cleanup agent resources"""
+async def test_cache_functionality(agent: ResearchAgent):
+    """Test caching functionality"""
+    print("\n=== Testing Cache Functionality ===")
+    
     try:
-        await agent.close_browser()
-        print("✅ Agent resources cleaned up")
+        # Clear cache first
+        await agent.clear_cache()
+        print("🧹 Cache cleared")
+        
+        # Get initial cache stats
+        initial_stats = await agent.get_cache_stats()
+        print(f"📊 Initial cache: {initial_stats['cache_files']} files")
+        
+        # Perform same scraping task twice
+        url = "https://httpbin.org/html"
+        task = ResearchTaskTemplates.web_scrape_task(url)
+        task["task_id"] = "cache_test_1"
+        
+        # First request (should cache)
+        print("🔄 First request (should cache)...")
+        start_time = asyncio.get_event_loop().time()
+        result1 = await agent.execute_task(task)
+        first_duration = asyncio.get_event_loop().time() - start_time
+        
+        # Second request (should hit cache)
+        print("⚡ Second request (should hit cache)...")
+        task["task_id"] = "cache_test_2"
+        start_time = asyncio.get_event_loop().time()
+        result2 = await agent.execute_task(task)
+        second_duration = asyncio.get_event_loop().time() - start_time
+        
+        # Check cache stats
+        final_stats = await agent.get_cache_stats()
+        print(f"📊 Final cache: {final_stats['cache_files']} files, {final_stats['cache_hits']} hits")
+        
+        # Verify both requests succeeded
+        if result1["status"] == "completed" and result2["status"] == "completed":
+            print(f"✅ Both requests completed")
+            print(f"⏱️  First: {first_duration:.2f}s, Second: {second_duration:.2f}s")
+            
+            if second_duration < first_duration * 0.8:  # Should be significantly faster
+                print("✅ Cache appears to be working (second request faster)")
+                return True
+            else:
+                print("⚠️  Second request not significantly faster (cache may not be working)")
+                return False
+        else:
+            print("❌ One or both requests failed")
+            return False
+            
     except Exception as e:
-        print(f"⚠️ Cleanup warning: {e}")
+        print(f"❌ Cache functionality test failed: {e}")
+        return False
 
-async def main():
-    """Main test function"""
-    print("🚀 Starting Research Agent Tests")
-    print("Make sure you have installed the required packages:")
-    print("pip install aiohttp beautifulsoup4 playwright arxiv feedparser PyPDF2 python-docx")
-    print("playwright install chromium")
-    print()
+async def run_comprehensive_tests():
+    """Run all research agent tests"""
+    print("🚀 Starting Comprehensive Research Agent Tests")
+    print("Make sure Redis is running (docker-compose up)")
+    print("=" * 60)
+    
+    # Test results tracking
+    test_results = {}
     
     # Initialize agent
     agent = await test_research_agent_initialization()
     if not agent:
-        print("❌ Cannot proceed without working agent")
+        print("❌ Cannot continue without agent initialization")
         return
     
-    # Run tests
-    test_results = {}
+    test_results["initialization"] = True
     
     try:
-        # Core functionality tests
-        test_results["web_research"] = await test_web_research_task(agent)
-        test_results["academic_search"] = await test_academic_search(agent)
-        test_results["news_search"] = await test_news_search(agent)
-        test_results["url_analysis"] = await test_url_analysis(agent)
+        # Test web scraping
+        scrape_results = await test_web_scraping(agent)
+        test_results["web_scraping"] = len(scrape_results) > 0
         
-        # Advanced tests  
-        test_results["message_communication"] = await test_message_communication(agent)
-        test_results["concurrent_requests"] = await test_concurrent_requests(agent)
-        test_results["error_handling"] = await test_error_handling(agent)
+        # Test arXiv search
+        arxiv_result = await test_arxiv_search(agent)
+        test_results["arxiv_search"] = arxiv_result is not None
+        
+        # Test news search
+        news_result = await test_news_search(agent)
+        test_results["news_search"] = news_result is not None and news_result.get("status") != "skipped"
+        
+        # Test document parsing
+        parse_results = await test_document_parsing(agent)
+        test_results["document_parsing"] = len(parse_results) > 0
+        
+        # Test batch URL extraction
+        batch_result = await test_batch_url_extraction(agent)
+        test_results["batch_extraction"] = batch_result is not None
+        
+        # Test message queue integration
+        mq_result = await test_message_queue_integration(agent)
+        test_results["message_queue"] = mq_result
+        
+        # Test cache functionality
+        cache_result = await test_cache_functionality(agent)
+        test_results["cache"] = cache_result
+        
+        # Final agent status
+        final_status = await agent.get_status()
+        stats = final_status.get("statistics", {})
+        
+        print("\n" + "=" * 60)
+        print("🏁 RESEARCH AGENT TEST SUMMARY")
+        print("=" * 60)
+        
+        for test_name, result in test_results.items():
+            status = "✅ PASS" if result else "❌ FAIL"
+            print(f"{test_name.replace('_', ' ').title():<25} {status}")
+        
+        print(f"\nAgent Statistics:")
+        print(f"Total Requests: {stats.get('total_requests', 0)}")
+        print(f"Successful: {stats.get('successful_requests', 0)}")
+        print(f"Failed: {stats.get('failed_requests', 0)}")
+        print(f"Cache Hits: {stats.get('cache_hits', 0)}")
+        print(f"Documents Processed: {stats.get('documents_processed', 0)}")
+        
+        success_rate = sum(test_results.values()) / len(test_results) * 100
+        print(f"\nOverall Success Rate: {success_rate:.1f}%")
+        
+        if success_rate >= 80:
+            print("🎉 Research Agent is working well!")
+        elif success_rate >= 60:
+            print("⚠️  Research Agent has some issues but basic functionality works")
+        else:
+            print("❌ Research Agent has significant issues")
         
     finally:
-        # Always cleanup
-        await cleanup_agent(agent)
-    
-    # Test summary
-    print("\n" + "="*60)
-    print("🎯 RESEARCH AGENT TEST SUMMARY")
-    print("="*60)
-    
-    for test_name, result in test_results.items():
-        status = "✅ PASS" if result else "❌ FAIL"
-        test_display = test_name.replace("_", " ").title()
-        print(f"{test_display:<25}: {status}")
-    
-    total_tests = len(test_results)
-    passed_tests = sum(test_results.values())
-    
-    print("-" * 60)
-    print(f"Total Tests: {total_tests}")
-    print(f"Passed: {passed_tests}")
-    print(f"Failed: {total_tests - passed_tests}")
-    print(f"Success Rate: {passed_tests/total_tests*100:.1f}%")
-    
-    if passed_tests == total_tests:
-        print("\n🎉 All tests passed! Research Agent is working perfectly.")
-    elif passed_tests >= total_tests * 0.7:
-        print("\n⚠️ Most tests passed. Research Agent is mostly functional.")
-    else:
-        print("\n❌ Many tests failed. Check the Research Agent implementation.")
-    
-    print("\n📝 Next Steps:")
-    print("1. Install missing dependencies if tests failed")
-    print("2. Test integration with vector store (ChromaDB)")
-    print("3. Add the research agent to your API endpoints")
-    print("4. Test end-to-end research workflow")
+        # Cleanup
+        await agent.shutdown()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n⚠️ Tests interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Test execution failed: {e}")
+    asyncio.run(run_comprehensive_tests())

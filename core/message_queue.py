@@ -1,280 +1,410 @@
+# src/core/message_queue.py
 import asyncio
 import json
 import logging
-from typing import Dict, Any, Optional, Callable, List
-from dataclasses import asdict
-import redis.asyncio as redis
-from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Union
+from datetime import datetime, timezone
 import uuid
 
-from core.config import settings
-from agents.base.agent import AgentMessage
+import redis.asyncio as redis
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+class Message(BaseModel):
+    """Message structure for inter-agent communication"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    from_agent: str
+    to_agent: Optional[str] = None  # None for broadcast
+    message_type: str
+    payload: Dict[str, Any]
+    priority: int = Field(default=5, ge=1, le=10)  # 1=highest, 10=lowest
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: Optional[datetime] = None
+    correlation_id: Optional[str] = None  # For request-response patterns
+
 
 class MessageQueue:
-    def __init__(self, redis_url: str = None):
-        self.redis_url = redis_url or settings.REDIS_URL
-        self.redis_client = None
-        self.pubsub = None
-        self.subscribers = {}  # agent_id -> callback function
-        self.logger = logging.getLogger(__name__)
+    """Redis-based message queue for inter-agent communication"""
+    
+    def __init__(self, redis_url: str = "redis://localhost:6379"):
+        self.redis_url = redis_url
+        self.redis: Optional[redis.Redis] = None
+        self.subscribers: Dict[str, List[Callable]] = {}
+        self.running = False
         
-    async def initialize(self):
-        """Initialize Redis connection and pub/sub"""
+    async def connect(self):
+        """Initialize Redis connection"""
         try:
-            self.redis_client = redis.from_url(
-                self.redis_url,
-                encoding="utf-8",
-                decode_responses=True
-            )
-            
-            # Test connection
-            await self.redis_client.ping()
-            self.logger.info("Redis connection established")
-            
-            # Initialize pub/sub
-            self.pubsub = self.redis_client.pubsub()
-            
+            self.redis = redis.from_url(self.redis_url, decode_responses=True)
+            await self.redis.ping()
+            logger.info("✅ Connected to Redis message queue")
         except Exception as e:
-            self.logger.error(f"Failed to initialize Redis: {e}")
+            logger.error(f"❌ Failed to connect to Redis: {e}")
             raise
     
-    async def close(self):
-        """Close Redis connections"""
-        if self.pubsub:
-            await self.pubsub.close()
-        if self.redis_client:
-            await self.redis_client.close()
-        self.logger.info("Redis connections closed")
+    async def disconnect(self):
+        """Close Redis connection"""
+        if self.redis:
+            await self.redis.close()
+            logger.info("📤 Disconnected from Redis")
     
-    async def send_message(self, message: AgentMessage) -> bool:
-        """Send message to specific agent via Redis pub/sub"""
+    async def publish_message(
+        self, 
+        message: Message,
+        channel: Optional[str] = None
+    ) -> bool:
+        """
+        Publish a message to a specific channel or agent queue
+        
+        Args:
+            message: Message to publish
+            channel: Optional specific channel, defaults to agent-specific queue
+        """
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
         try:
-            channel = f"agent:{message.receiver_id}"
-            message_data = {
-                "id": message.id,
-                "sender_id": message.sender_id,
-                "receiver_id": message.receiver_id,
-                "message_type": message.message_type,
-                "content": message.content,
-                "timestamp": message.timestamp.isoformat(),
-                "correlation_id": message.correlation_id
-            }
+            # Default channel based on target agent
+            if not channel:
+                channel = f"agent:{message.to_agent}" if message.to_agent else "broadcast"
             
-            # Publish message
-            await self.redis_client.publish(channel, json.dumps(message_data))
+            # Serialize message
+            message_data = message.model_dump_json()
             
-            # Also store in message history for reliability
-            await self._store_message_history(message)
+            # Publish to channel
+            await self.redis.publish(channel, message_data)
             
-            self.logger.info(f"Message sent from {message.sender_id} to {message.receiver_id}")
+            # Also add to priority queue for persistence
+            priority_score = message.priority * 1000000 - int(message.created_at.timestamp())
+            queue_key = f"queue:{channel}"
+            
+            await self.redis.zadd(
+                queue_key,
+                {message_data: priority_score}
+            )
+            
+            # Set expiration if specified
+            if message.expires_at:
+                ttl = int((message.expires_at - message.created_at).total_seconds())
+                await self.redis.expire(queue_key, ttl)
+            
+            logger.debug(f"📤 Published message {message.id} to {channel}")
             return True
             
         except Exception as e:
-            self.logger.error(f"Failed to send message: {e}")
+            logger.error(f"❌ Failed to publish message: {e}")
             return False
     
-    async def subscribe_to_messages(self, agent_id: str, callback: Callable):
-        """Subscribe agent to receive messages"""
-        try:
-            channel = f"agent:{agent_id}"
-            await self.pubsub.subscribe(channel)
-            
-            self.subscribers[agent_id] = callback
-            self.logger.info(f"Agent {agent_id} subscribed to messages")
-            
-            # Start message listener task
-            asyncio.create_task(self._message_listener(agent_id))
-            
-        except Exception as e:
-            self.logger.error(f"Failed to subscribe agent {agent_id}: {e}")
+    async def subscribe_to_channel(
+        self, 
+        channel: str, 
+        callback: Callable[[Message], None]
+    ):
+        """
+        Subscribe to a specific channel
+        
+        Args:
+            channel: Channel to subscribe to
+            callback: Function to call when message received
+        """
+        if channel not in self.subscribers:
+            self.subscribers[channel] = []
+        self.subscribers[channel].append(callback)
+        
+        logger.info(f"📥 Subscribed to channel: {channel}")
     
-    async def unsubscribe_from_messages(self, agent_id: str):
-        """Unsubscribe agent from messages"""
+    async def start_listening(self):
+        """Start the message listener"""
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
+        self.running = True
+        
+        # Subscribe to all registered channels
+        if not self.subscribers:
+            logger.warning("⚠️ No subscribers registered")
+            return
+        
+        pubsub = self.redis.pubsub()
+        
         try:
-            channel = f"agent:{agent_id}"
-            await self.pubsub.unsubscribe(channel)
+            # Subscribe to all channels
+            for channel in self.subscribers.keys():
+                await pubsub.subscribe(channel)
+                logger.info(f"🎧 Listening on channel: {channel}")
             
-            if agent_id in self.subscribers:
-                del self.subscribers[agent_id]
-            
-            self.logger.info(f"Agent {agent_id} unsubscribed from messages")
-            
+            # Listen for messages
+            while self.running:
+                try:
+                    message = await pubsub.get_message(timeout=1.0)
+                    if message and message['type'] == 'message':
+                        await self._process_message(message['channel'], message['data'])
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error in message listener: {e}")
+                    await asyncio.sleep(1)
+                    
         except Exception as e:
-            self.logger.error(f"Failed to unsubscribe agent {agent_id}: {e}")
+            logger.error(f"❌ Failed to start message listener: {e}")
+        finally:
+            await pubsub.close()
+            self.running = False
     
-    async def _message_listener(self, agent_id: str):
-        """Listen for messages for a specific agent"""
+    async def _process_message(self, channel: str, data: str):
+        """Process incoming message"""
         try:
-            async for message in self.pubsub.listen():
-                if message["type"] == "message":
-                    try:
-                        message_data = json.loads(message["data"])
-                        agent_message = AgentMessage(
-                            id=message_data["id"],
-                            sender_id=message_data["sender_id"],
-                            receiver_id=message_data["receiver_id"],
-                            message_type=message_data["message_type"],
-                            content=message_data["content"],
-                            timestamp=datetime.fromisoformat(message_data["timestamp"]),
-                            correlation_id=message_data.get("correlation_id")
-                        )
-                        
-                        # Call the agent's message handler
-                        if agent_id in self.subscribers:
-                            await self.subscribers[agent_id](agent_message)
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error processing message for {agent_id}: {e}")
-                        
+            message = Message.model_validate_json(data)
+            
+            # Call registered callbacks
+            callbacks = self.subscribers.get(channel, [])
+            for callback in callbacks:
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(message)
+                    else:
+                        callback(message)
+                except Exception as e:
+                    logger.error(f"Error in message callback: {e}")
+                    
         except Exception as e:
-            self.logger.error(f"Message listener error for {agent_id}: {e}")
+            logger.error(f"Error processing message: {e}")
     
-    async def broadcast_message(self, sender_id: str, message_type: str, content: Dict[str, Any], agent_types: List[str] = None):
-        """Broadcast message to multiple agents or all agents of specific types"""
-        try:
-            message_id = str(uuid.uuid4())
-            
-            if agent_types:
-                # Broadcast to specific agent types
-                for agent_type in agent_types:
-                    channel = f"agent_type:{agent_type}"
-                    message_data = {
-                        "id": message_id,
-                        "sender_id": sender_id,
-                        "receiver_id": f"broadcast:{agent_type}",
-                        "message_type": message_type,
-                        "content": content,
-                        "timestamp": datetime.utcnow().isoformat(),
-                        "correlation_id": None
-                    }
-                    await self.redis_client.publish(channel, json.dumps(message_data))
-            else:
-                # Broadcast to all agents
-                channel = "agent_broadcast"
-                message_data = {
-                    "id": message_id,
-                    "sender_id": sender_id,
-                    "receiver_id": "broadcast:all",
-                    "message_type": message_type,
-                    "content": content,
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "correlation_id": None
-                }
-                await self.redis_client.publish(channel, json.dumps(message_data))
-            
-            self.logger.info(f"Broadcast message sent from {sender_id}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to broadcast message: {e}")
-            return False
+    async def stop_listening(self):
+        """Stop the message listener"""
+        self.running = False
+        logger.info("🛑 Message listener stopped")
     
-    async def get_message_history(self, agent_id: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Get message history for an agent"""
+    async def get_message_from_queue(
+        self, 
+        channel: str, 
+        timeout: int = 5
+    ) -> Optional[Message]:
+        """
+        Get a message from persistent queue
+        
+        Args:
+            channel: Channel/queue name
+            timeout: Timeout in seconds
+        """
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
         try:
-            key = f"messages:{agent_id}"
-            messages = await self.redis_client.lrange(key, 0, limit - 1)
+            queue_key = f"queue:{channel}"
             
-            return [json.loads(msg) for msg in messages]
-            
-        except Exception as e:
-            self.logger.error(f"Failed to get message history for {agent_id}: {e}")
-            return []
-    
-    async def _store_message_history(self, message: AgentMessage):
-        """Store message in history for both sender and receiver"""
-        try:
-            message_data = {
-                "id": message.id,
-                "sender_id": message.sender_id,
-                "receiver_id": message.receiver_id,
-                "message_type": message.message_type,
-                "content": message.content,
-                "timestamp": message.timestamp.isoformat(),
-                "correlation_id": message.correlation_id
-            }
-            
-            # Store for receiver
-            receiver_key = f"messages:{message.receiver_id}"
-            await self.redis_client.lpush(receiver_key, json.dumps(message_data))
-            await self.redis_client.ltrim(receiver_key, 0, 999)  # Keep last 1000 messages
-            
-            # Store for sender
-            sender_key = f"messages:{message.sender_id}"
-            await self.redis_client.lpush(sender_key, json.dumps(message_data))
-            await self.redis_client.ltrim(sender_key, 0, 999)  # Keep last 1000 messages
-            
-        except Exception as e:
-            self.logger.error(f"Failed to store message history: {e}")
-    
-    async def create_task_queue(self, queue_name: str):
-        """Create a task queue for work distribution"""
-        try:
-            # Initialize queue if it doesn't exist
-            key = f"queue:{queue_name}"
-            if not await self.redis_client.exists(key):
-                await self.redis_client.lpush(key, "initialized")
-                await self.redis_client.lpop(key)
-            
-            self.logger.info(f"Task queue '{queue_name}' created/initialized")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to create task queue {queue_name}: {e}")
-    
-    async def add_task_to_queue(self, queue_name: str, task: Dict[str, Any]) -> bool:
-        """Add task to a queue"""
-        try:
-            key = f"queue:{queue_name}"
-            task_data = json.dumps(task)
-            await self.redis_client.lpush(key, task_data)
-            
-            self.logger.info(f"Task added to queue '{queue_name}': {task.get('task_id', 'unknown')}")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to add task to queue {queue_name}: {e}")
-            return False
-    
-    async def get_task_from_queue(self, queue_name: str, timeout: int = 1) -> Optional[Dict[str, Any]]:
-        """Get task from queue (blocking with timeout)"""
-        try:
-            key = f"queue:{queue_name}"
-            result = await self.redis_client.brpop(key, timeout=timeout)
+            # Get highest priority message
+            result = await self.redis.zpopmin(queue_key, 1)
             
             if result:
-                _, task_data = result
+                message_data = result[0][0]  # First item, message data
+                return Message.model_validate_json(message_data)
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting message from queue: {e}")
+            return None
+    
+    async def send_message_to_agent(self, agent_id: str, message: Message) -> bool:
+        """Send message directly to an agent"""
+        channel = f"agent:{agent_id}"
+        return await self.publish_message(message, channel)
+    
+    async def broadcast_message(self, message: Message) -> bool:
+        """Send broadcast message to all agents"""
+        return await self.publish_message(message, "broadcast")
+    
+    async def subscribe_to_agent(self, agent_id: str, callback: Callable[[Message], None]):
+        """Subscribe to messages for a specific agent"""
+        channel = f"agent:{agent_id}"
+        await self.subscribe_to_channel(channel, callback)
+    
+    async def subscribe_to_broadcast(self, callback: Callable[[Message], None]):
+        """Subscribe to broadcast messages"""
+        await self.subscribe_to_channel("broadcast", callback)
+    
+    async def get_queue_length(self, queue_name: str) -> int:
+        """Get the length of a queue"""
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
+        try:
+            queue_key = f"queue:{queue_name}"
+            length = await self.redis.zcard(queue_key)
+            return length
+        except Exception as e:
+            logger.error(f"❌ Error getting queue length: {e}")
+            return 0
+    
+    async def create_task_queue(self, queue_name: str):
+        """Create/initialize a task queue"""
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
+        try:
+            queue_key = f"queue:{queue_name}"
+            # Just ensure the key exists (Redis will create it on first use)
+            await self.redis.exists(queue_key)
+            logger.info(f"Task queue '{queue_name}' created/initialized")
+        except Exception as e:
+            logger.error(f"❌ Error creating task queue: {e}")
+            raise
+    
+    async def add_task_to_queue(
+        self, 
+        queue_name: str, 
+        task: Dict[str, Any], 
+        priority: int = 5
+    ) -> bool:
+        """Add a task to a queue"""
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
+        try:
+            queue_key = f"queue:{queue_name}"
+            task_data = json.dumps(task)
+            
+            # Use priority and timestamp for scoring
+            score = priority * 1000000 - int(datetime.now(timezone.utc).timestamp())
+            
+            await self.redis.zadd(queue_key, {task_data: score})
+            
+            task_id = task.get('task_id', 'unknown')
+            logger.info(f"Task added to queue '{queue_name}': {task_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error adding task to queue: {e}")
+            return False
+    
+    async def get_task_from_queue(
+        self, 
+        queue_name: str, 
+        timeout: int = 5
+    ) -> Optional[Dict[str, Any]]:
+        """Get a task from a queue"""
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
+        try:
+            queue_key = f"queue:{queue_name}"
+            
+            # Get highest priority task
+            result = await self.redis.zpopmin(queue_key, 1)
+            
+            if result:
+                task_data = result[0][0]  # First item, task data
                 return json.loads(task_data)
             
             return None
             
         except Exception as e:
-            self.logger.error(f"Failed to get task from queue {queue_name}: {e}")
+            logger.error(f"❌ Error getting task from queue: {e}")
             return None
     
-    async def get_queue_length(self, queue_name: str) -> int:
-        """Get number of tasks in queue"""
+    async def get_message_history(
+        self, 
+        agent_id: str, 
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get message history for an agent"""
+        if not self.redis:
+            raise RuntimeError("Redis not connected")
+        
         try:
-            key = f"queue:{queue_name}"
-            return await self.redis_client.llen(key)
+            history_key = f"history:{agent_id}"
+            
+            # Get recent messages (stored as JSON strings)
+            messages = await self.redis.lrange(history_key, 0, limit - 1)
+            
+            return [json.loads(msg) for msg in messages]
             
         except Exception as e:
-            self.logger.error(f"Failed to get queue length for {queue_name}: {e}")
-            return 0
+            logger.error(f"❌ Error getting message history: {e}")
+            return []
+    
+    async def store_message_in_history(self, agent_id: str, message: Message):
+        """Store message in agent's history"""
+        if not self.redis:
+            return
+        
+        try:
+            history_key = f"history:{agent_id}"
+            message_data = json.dumps({
+                "id": message.id,
+                "from_agent": message.from_agent,
+                "to_agent": message.to_agent,
+                "message_type": message.message_type,
+                "payload": message.payload,
+                "created_at": message.created_at.isoformat(),
+                "correlation_id": message.correlation_id
+            })
+            
+            # Store message and keep only recent 1000 messages
+            await self.redis.lpush(history_key, message_data)
+            await self.redis.ltrim(history_key, 0, 999)
+            
+        except Exception as e:
+            logger.error(f"❌ Error storing message history: {e}")
     
     async def health_check(self) -> bool:
         """Check if Redis is healthy"""
-        try:
-            await self.redis_client.ping()
-            return True
-        except Exception as e:
-            self.logger.error(f"Redis health check failed: {e}")
+        if not self.redis:
             return False
+        
+        try:
+            await self.redis.ping()
+            return True
+        except Exception:
+            return False
+    
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get message queue statistics"""
+        if not self.redis:
+            return {"status": "disconnected"}
+        
+        try:
+            info = await self.redis.info()
+            return {
+                "status": "connected",
+                "connected_clients": info.get("connected_clients", 0),
+                "used_memory": info.get("used_memory_human", "unknown"),
+                "total_commands_processed": info.get("total_commands_processed", 0),
+                "subscribers": len(self.subscribers)
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
-# Global message queue instances
-message_queue = MessageQueue()
+
+# Global message queue instance
+_message_queue: Optional[MessageQueue] = None
+
 
 async def get_message_queue() -> MessageQueue:
-    """Get message queue instance"""
-    if not message_queue.redis_client:
-        await message_queue.initialize()
-    return message_queue
+    """Get or create the global message queue instance"""
+    global _message_queue
+    
+    if _message_queue is None:
+        _message_queue = MessageQueue()
+        await _message_queue.connect()
+        
+        # Start the message listener
+        asyncio.create_task(_message_queue.start_listening())
+        
+        logger.info("📡 Message queue initialized and listening")
+    
+    return _message_queue
+
+
+async def shutdown_message_queue():
+    """Shutdown the global message queue"""
+    global _message_queue
+    
+    if _message_queue:
+        await _message_queue.stop_listening()
+        await _message_queue.disconnect()
+        _message_queue = None
+        logger.info("📡 Message queue shutdown complete")

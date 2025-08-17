@@ -1,573 +1,1023 @@
-# agents/research/research_agent.py
+# src/agents/research/research_agent.py
 import asyncio
-import aiohttp
-import logging
+import json
+import os
 from typing import Dict, Any, List, Optional, Union
 from datetime import datetime, timezone
-import re
-from urllib.parse import urljoin, urlparse
-from dataclasses import dataclass
-import json
+import logging
+import aiohttp
+import aiofiles
+from pathlib import Path
 import hashlib
-
-# Web scraping imports
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Browser, Page
-import feedparser
-import arxiv
+import tempfile
 
 # Document processing imports
-import PyPDF2
-import docx
-from io import BytesIO
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logging.warning("Playwright not available - web scraping will be limited")
 
-from agents.base.agent import BaseAgent, AgentMessage
+try:
+    from bs4 import BeautifulSoup
+    import requests
+    BEAUTIFULSOUP_AVAILABLE = True
+except ImportError:
+    BEAUTIFULSOUP_AVAILABLE = False
+    logging.warning("BeautifulSoup not available")
 
-@dataclass
-class ResearchResult:
-    """Data class for research results"""
-    url: str
-    title: str
-    content: str
-    metadata: Dict[str, Any]
-    extracted_at: datetime
-    content_type: str
-    word_count: int
-    source_quality_score: float
+try:
+    import PyPDF2
+    import docx
+    PDF_DOCX_AVAILABLE = True
+except ImportError:
+    PDF_DOCX_AVAILABLE = False
+    logging.warning("PDF/DOCX processing not available")
 
-@dataclass
-class SearchQuery:
-    """Data class for search queries"""
-    query: str
-    search_type: str  # "web", "academic", "news"
-    max_results: int = 10
-    date_filter: Optional[str] = None
-    domain_filter: Optional[List[str]] = None
+#import agents.research.research_agent
+#from agents.research.research_agent import ResearchAgent
+from agents.base.agent import BaseAgent
+from core.message_queue import Message
+
 
 class ResearchAgent(BaseAgent):
     """
-    Research Agent for web scraping, academic paper retrieval, and content extraction
+    Specialized agent for research tasks including:
+    - Web scraping
+    - Academic paper retrieval
+    - News API integration
+    - Document parsing
     """
     
-    def __init__(self, agent_id: str = None):
-        super().__init__("research", agent_id or "research_agent_001")
-        self.browser: Optional[Browser] = None
-        self.playwright_context = None
+    def __init__(self, agent_id: str = "research_agent"):
+        super().__init__(agent_id, agent_type="research")
         
         # Configuration
-        self.max_content_length = 50000  # Maximum content length to extract
-        self.request_timeout = 30  # HTTP request timeout in seconds
-        self.concurrent_requests = 5  # Max concurrent requests
-        
-        # Headers for web scraping
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
+        self.config = {
+            "max_content_length": 1000000,  # 1MB
+            "request_timeout": 30,
+            "max_concurrent_requests": 5,
+            "cache_duration": 3600,  # 1 hour
+            "supported_formats": ["html", "pdf", "docx", "txt", "json"],
+            "news_api_key": os.getenv("NEWS_API_KEY"),
+            "arxiv_base_url": "http://export.arxiv.org/api/query",
         }
+        
+        # Initialize components
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.cache_dir = Path(tempfile.gettempdir()) / "research_agent_cache"
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        # Semaphore for concurrent requests
+        self.request_semaphore = asyncio.Semaphore(self.config["max_concurrent_requests"])
+        
+        # Statistics
+        self.stats = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "documents_processed": 0,
+            "cache_hits": 0,
+            "started_at": datetime.now(timezone.utc)
+        }
+        
+        # Register research-specific message handlers
+        self._message_handlers.update({
+            "research_task": self._handle_research_task,
+            "web_scrape": self._handle_web_scrape,
+            "arxiv_search": self._handle_arxiv_search,
+            "news_search": self._handle_news_search,
+            "document_parse": self._handle_document_parse,
+            "url_extract": self._handle_url_extract,
+        })
     
-    async def initialize_browser(self):
-        """Initialize Playwright browser for JavaScript-heavy sites"""
-        try:
-            if not self.playwright_context:
-                self.playwright_context = await async_playwright().start()
-                self.browser = await self.playwright_context.chromium.launch(
-                    headless=True,
-                    args=['--no-sandbox', '--disable-dev-shm-usage']
-                )
-                self.logger.info("Playwright browser initialized")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize browser: {e}")
+    async def initialize(self):
+        """Initialize the research agent"""
+        await super().initialize()
+        
+        # Initialize HTTP session
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config["request_timeout"]),
+            headers={
+                "User-Agent": "ResearchAgent/1.0 (Multi-Agent Research System)"
+            }
+        )
+        
+        self.logger.info("🔬 Research Agent initialized with capabilities:")
+        self.logger.info(f"  - Web scraping: {'✅' if PLAYWRIGHT_AVAILABLE else '⚠️  Limited'}")
+        self.logger.info(f"  - HTML parsing: {'✅' if BEAUTIFULSOUP_AVAILABLE else '❌'}")
+        self.logger.info(f"  - PDF/DOCX: {'✅' if PDF_DOCX_AVAILABLE else '❌'}")
+        self.logger.info(f"  - News API: {'✅' if self.config['news_api_key'] else '⚠️  No API key'}")
     
-    async def close_browser(self):
-        """Close Playwright browser"""
-        try:
-            if self.browser:
-                await self.browser.close()
-            if self.playwright_context:
-                await self.playwright_context.stop()
-            self.logger.info("Browser closed")
-        except Exception as e:
-            self.logger.error(f"Error closing browser: {e}")
+    async def shutdown(self):
+        """Shutdown the research agent"""
+        if self.session:
+            await self.session.close()
+        await super().shutdown()
     
-    async def process_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a research task"""
-        task_type = task.get("task_type")
+    async def execute_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a research task"""
+        task_type = task.get("type", "unknown")
+        task_id = task.get("task_id", "unknown")
+        
+        self.stats["total_requests"] += 1
         
         try:
-            if task_type == "web_research":
-                return await self._handle_web_research(task)
-            elif task_type == "academic_search":
-                return await self._handle_academic_search(task)
+            if task_type == "web_scrape":
+                result = await self._web_scrape(task.get("url"), task.get("options", {}))
+            elif task_type == "arxiv_search":
+                result = await self._arxiv_search(task.get("query"), task.get("max_results", 10))
             elif task_type == "news_search":
-                return await self._handle_news_search(task)
-            elif task_type == "document_extraction":
-                return await self._handle_document_extraction(task)
-            elif task_type == "url_analysis":
-                return await self._handle_url_analysis(task)
+                result = await self._news_search(task.get("query"), task.get("options", {}))
+            elif task_type == "document_parse":
+                result = await self._parse_document(task.get("document_path"))
+            elif task_type == "url_batch_extract":
+                result = await self._batch_url_extract(task.get("urls", []))
+            elif task_type == "research_summary":
+                result = await self._create_research_summary(task.get("sources", []))
             else:
-                return {
-                    "status": "error",
-                    "task_id": task.get("task_id"),
-                    "error": f"Unknown task type: {task_type}"
-                }
-                
-        except Exception as e:
-            self.logger.error(f"Error processing task {task.get('task_id')}: {e}")
+                raise ValueError(f"Unknown research task type: {task_type}")
+            
+            self.stats["successful_requests"] += 1
+            self.stats["documents_processed"] += 1
+            
             return {
-                "status": "error",
-                "task_id": task.get("task_id"),
-                "error": str(e)
+                "task_id": task_id,
+                "status": "completed",
+                "result": result,
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "agent_id": self.agent_id
+            }
+            
+        except Exception as e:
+            self.stats["failed_requests"] += 1
+            self.logger.error(f"Research task failed: {e}")
+            
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "error": str(e),
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "agent_id": self.agent_id
             }
     
-    async def _handle_web_research(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle general web research task"""
-        query_data = task.get("query", {})
-        search_query = SearchQuery(**query_data)
-        
-        # Perform web search using multiple search engines
-        results = await self._perform_web_search(search_query)
-        
-        # Extract content from top results
-        extracted_results = []
-        semaphore = asyncio.Semaphore(self.concurrent_requests)
-        
-        async def extract_content(result):
-            async with semaphore:
-                return await self._extract_web_content(result["url"])
-        
-        # Process URLs concurrently
-        extraction_tasks = [extract_content(result) for result in results[:search_query.max_results]]
-        extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
-        
-        # Filter successful extractions
-        for i, result in enumerate(extraction_results):
-            if isinstance(result, ResearchResult):
-                extracted_results.append({
-                    "url": result.url,
-                    "title": result.title,
-                    "content": result.content[:2000] + "..." if len(result.content) > 2000 else result.content,
-                    "metadata": result.metadata,
-                    "word_count": result.word_count,
-                    "quality_score": result.source_quality_score,
-                    "extracted_at": result.extracted_at.isoformat()
-                })
+    async def get_status(self) -> Dict[str, Any]:
+        """Get research agent status"""
+        uptime = datetime.now(timezone.utc) - self.stats["started_at"]
         
         return {
-            "status": "completed",
-            "task_id": task.get("task_id"),
-            "query": search_query.query,
-            "results_found": len(extracted_results),
-            "results": extracted_results,
-            "metadata": {
-                "search_type": "web_research",
-                "processed_at": datetime.now(timezone.utc).isoformat()
-            }
-        }
-    
-    async def _handle_academic_search(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle academic paper search via arXiv"""
-        query = task.get("query", "")
-        max_results = task.get("max_results", 10)
-        
-        try:
-            # Search arXiv
-            search = arxiv.Search(
-                query=query,
-                max_results=max_results,
-                sort_by=arxiv.SortCriterion.Relevance
-            )
-            
-            papers = []
-            for paper in search.results():
-                papers.append({
-                    "title": paper.title,
-                    "authors": [str(author) for author in paper.authors],
-                    "abstract": paper.summary,
-                    "url": paper.entry_id,
-                    "pdf_url": paper.pdf_url,
-                    "published": paper.published.isoformat() if paper.published else None,
-                    "categories": paper.categories,
-                    "metadata": {
-                        "doi": paper.doi,
-                        "journal_ref": paper.journal_ref,
-                        "primary_category": paper.primary_category
-                    }
-                })
-            
-            return {
-                "status": "completed",
-                "task_id": task.get("task_id"),
-                "query": query,
-                "results_found": len(papers),
-                "results": papers,
-                "metadata": {
-                    "search_type": "academic",
-                    "source": "arxiv",
-                    "processed_at": datetime.now(timezone.utc).isoformat()
-                }
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Academic search error: {e}")
-            return {
-                "status": "error",
-                "task_id": task.get("task_id"),
-                "error": f"Academic search failed: {str(e)}"
-            }
-    
-    async def _handle_news_search(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle news search and RSS feed processing"""
-        query = task.get("query", "")
-        news_sources = task.get("sources", [
-            "https://rss.cnn.com/rss/edition.rss",
-            "https://feeds.bbci.co.uk/news/rss.xml",
-            "https://feeds.reuters.com/reuters/topNews"
-        ])
-        
-        results = []
-        
-        for source_url in news_sources:
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                    async with session.get(source_url, headers=self.headers) as response:
-                        if response.status == 200:
-                            content = await response.text()
-                            feed = feedparser.parse(content)
-                            
-                            for entry in feed.entries[:5]:  # Top 5 from each source
-                                # Simple keyword matching for relevance
-                                if query.lower() in (entry.title + " " + entry.get('summary', '')).lower():
-                                    results.append({
-                                        "title": entry.title,
-                                        "url": entry.link,
-                                        "summary": entry.get('summary', ''),
-                                        "published": entry.get('published', ''),
-                                        "source": feed.feed.get('title', source_url),
-                                        "metadata": {
-                                            "tags": entry.get('tags', []),
-                                            "author": entry.get('author', '')
-                                        }
-                                    })
-            except Exception as e:
-                self.logger.warning(f"Failed to fetch news from {source_url}: {e}")
-        
-        return {
-            "status": "completed",
-            "task_id": task.get("task_id"),
-            "query": query,
-            "results_found": len(results),
-            "results": results[:task.get("max_results", 20)],
-            "metadata": {
-                "search_type": "news",
-                "sources_checked": len(news_sources),
-                "processed_at": datetime.now(timezone.utc).isoformat()
-            }
-        }
-    
-    async def _handle_document_extraction(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle document content extraction (PDF, DOCX, etc.)"""
-        document_url = task.get("url")
-        document_type = task.get("document_type", "auto")
-        
-        try:
-            # Download document
-            async with aiohttp.ClientSession() as session:
-                async with session.get(document_url, headers=self.headers) as response:
-                    if response.status != 200:
-                        raise Exception(f"Failed to download document: HTTP {response.status}")
-                    
-                    content_bytes = await response.read()
-                    
-                    # Auto-detect document type if not specified
-                    if document_type == "auto":
-                        content_type = response.headers.get('content-type', '').lower()
-                        if 'pdf' in content_type:
-                            document_type = "pdf"
-                        elif 'word' in content_type or 'docx' in content_type:
-                            document_type = "docx"
-                        else:
-                            document_type = "html"
-            
-            # Extract content based on type
-            if document_type == "pdf":
-                extracted_text = await self._extract_pdf_content(content_bytes)
-            elif document_type == "docx":
-                extracted_text = await self._extract_docx_content(content_bytes)
-            else:
-                extracted_text = await self._extract_html_content(content_bytes.decode('utf-8'))
-            
-            return {
-                "status": "completed",
-                "task_id": task.get("task_id"),
-                "document_url": document_url,
-                "document_type": document_type,
-                "content": extracted_text[:5000] + "..." if len(extracted_text) > 5000 else extracted_text,
-                "word_count": len(extracted_text.split()),
-                "metadata": {
-                    "extraction_method": f"{document_type}_extraction",
-                    "processed_at": datetime.now(timezone.utc).isoformat()
-                }
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Document extraction error: {e}")
-            return {
-                "status": "error",
-                "task_id": task.get("task_id"),
-                "error": f"Document extraction failed: {str(e)}"
-            }
-    
-    async def _handle_url_analysis(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle detailed analysis of a specific URL"""
-        url = task.get("url")
-        
-        try:
-            result = await self._extract_web_content(url, detailed_analysis=True)
-            
-            return {
-                "status": "completed",
-                "task_id": task.get("task_id"),
-                "url": url,
-                "analysis": {
-                    "title": result.title,
-                    "content_preview": result.content[:1000] + "..." if len(result.content) > 1000 else result.content,
-                    "word_count": result.word_count,
-                    "quality_score": result.source_quality_score,
-                    "metadata": result.metadata,
-                    "extracted_at": result.extracted_at.isoformat()
-                }
-            }
-            
-        except Exception as e:
-            return {
-                "status": "error",
-                "task_id": task.get("task_id"),
-                "error": f"URL analysis failed: {str(e)}"
-            }
-    
-    async def _perform_web_search(self, search_query: SearchQuery) -> List[Dict[str, Any]]:
-        """Perform web search using DuckDuckGo (no API key required)"""
-        # This is a simplified implementation
-        # In production, you might want to integrate with proper search APIs
-        search_results = [
-            {
-                "url": "https://example.com/result1",
-                "title": f"Search result for '{search_query.query}' - Result 1",
-                "snippet": "This is a sample search result..."
+            "capabilities": {
+                "web_scraping": PLAYWRIGHT_AVAILABLE,
+                "html_parsing": BEAUTIFULSOUP_AVAILABLE,
+                "document_parsing": PDF_DOCX_AVAILABLE,
+                "news_api": bool(self.config["news_api_key"]),
+                "arxiv_search": True
             },
-            {
-                "url": "https://example.com/result2", 
-                "title": f"Search result for '{search_query.query}' - Result 2",
-                "snippet": "Another sample search result..."
+            "statistics": {
+                **self.stats,
+                "uptime_seconds": uptime.total_seconds(),
+                "success_rate": (
+                    self.stats["successful_requests"] / max(self.stats["total_requests"], 1)
+                ) * 100
+            },
+            "configuration": {
+                "max_concurrent_requests": self.config["max_concurrent_requests"],
+                "request_timeout": self.config["request_timeout"],
+                "supported_formats": self.config["supported_formats"]
             }
-        ]
-        
-        return search_results
-    
-    async def _extract_web_content(self, url: str, detailed_analysis: bool = False) -> ResearchResult:
-        """Extract content from a web page"""
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.request_timeout)
-            ) as session:
-                async with session.get(url, headers=self.headers) as response:
-                    if response.status != 200:
-                        raise Exception(f"HTTP {response.status} for {url}")
-                    
-                    html_content = await response.text()
-                    
-            # Parse with BeautifulSoup
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Extract title
-            title = "No Title"
-            if soup.title:
-                title = soup.title.string.strip()
-            elif soup.find('h1'):
-                title = soup.find('h1').get_text().strip()
-            
-            # Remove script and style elements
-            for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                script.decompose()
-            
-            # Extract main content
-            content = ""
-            
-            # Try to find main content areas
-            main_content = (
-                soup.find('main') or 
-                soup.find('article') or 
-                soup.find('div', class_=re.compile(r'content|main|body', re.I)) or
-                soup.find('div', id=re.compile(r'content|main|body', re.I))
-            )
-            
-            if main_content:
-                content = main_content.get_text()
-            else:
-                content = soup.get_text()
-            
-            # Clean up content
-            content = re.sub(r'\s+', ' ', content).strip()
-            content = content[:self.max_content_length]
-            
-            # Calculate quality score
-            quality_score = self._calculate_quality_score(content, url, soup)
-            
-            # Extract metadata
-            metadata = self._extract_metadata(soup, url, detailed_analysis)
-            
-            return ResearchResult(
-                url=url,
-                title=title,
-                content=content,
-                metadata=metadata,
-                extracted_at=datetime.now(timezone.utc),
-                content_type="text/html",
-                word_count=len(content.split()),
-                source_quality_score=quality_score
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Content extraction failed for {url}: {e}")
-            raise
-    
-    async def _extract_pdf_content(self, pdf_bytes: bytes) -> str:
-        """Extract text content from PDF"""
-        try:
-            pdf_file = BytesIO(pdf_bytes)
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            
-            return text.strip()
-            
-        except Exception as e:
-            self.logger.error(f"PDF extraction error: {e}")
-            raise
-    
-    async def _extract_docx_content(self, docx_bytes: bytes) -> str:
-        """Extract text content from DOCX"""
-        try:
-            doc_file = BytesIO(docx_bytes)
-            doc = docx.Document(doc_file)
-            
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            
-            return text.strip()
-            
-        except Exception as e:
-            self.logger.error(f"DOCX extraction error: {e}")
-            raise
-    
-    async def _extract_html_content(self, html: str) -> str:
-        """Extract text from HTML content"""
-        soup = BeautifulSoup(html, 'html.parser')
-        return soup.get_text()
-    
-    def _calculate_quality_score(self, content: str, url: str, soup: BeautifulSoup) -> float:
-        """Calculate content quality score (0-1)"""
-        score = 0.5  # Base score
-        
-        # Content length factor
-        if len(content) > 500:
-            score += 0.1
-        if len(content) > 2000:
-            score += 0.1
-        
-        # Domain reputation (simplified)
-        domain = urlparse(url).netloc.lower()
-        trusted_domains = ['wikipedia.org', 'scholar.google.com', 'arxiv.org', 'nature.com', 'science.org']
-        if any(trusted in domain for trusted in trusted_domains):
-            score += 0.2
-        
-        # Presence of structured content
-        if soup.find_all(['h1', 'h2', 'h3']):
-            score += 0.05
-        if soup.find_all('p'):
-            score += 0.05
-        
-        return min(1.0, score)
-    
-    def _extract_metadata(self, soup: BeautifulSoup, url: str, detailed: bool = False) -> Dict[str, Any]:
-        """Extract metadata from HTML"""
-        metadata = {
-            "url": url,
-            "domain": urlparse(url).netloc
         }
-        
-        # Meta tags
-        meta_tags = soup.find_all('meta')
-        for tag in meta_tags:
-            if tag.get('name') == 'description':
-                metadata['description'] = tag.get('content', '')[:200]
-            elif tag.get('name') == 'keywords':
-                metadata['keywords'] = tag.get('content', '').split(',')
-            elif tag.get('name') == 'author':
-                metadata['author'] = tag.get('content', '')
-            elif tag.get('property') == 'og:title':
-                metadata['og_title'] = tag.get('content', '')
-        
-        if detailed:
-            # Additional analysis for detailed mode
-            metadata.update({
-                'headings_count': len(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])),
-                'paragraphs_count': len(soup.find_all('p')),
-                'links_count': len(soup.find_all('a')),
-                'images_count': len(soup.find_all('img'))
-            })
-        
-        return metadata
     
-    async def _handle_message(self, message: AgentMessage):
-        """Handle incoming messages"""
-        self.logger.info(f"Research agent received message: {message.message_type}")
-        
-        if message.message_type == "research_request":
-            # Handle research request
-            task_data = message.content
-            result = await self.process_task(task_data)
+    # Message Handlers
+    async def _handle_research_task(self, message: Message):
+        """Handle general research task messages"""
+        try:
+            task_data = message.payload
+            result = await self.execute_task(task_data)
             
-            # Send result back
             await self.send_message(
-                message.sender_id,
+                message.from_agent,
                 "research_result",
                 result,
                 correlation_id=message.correlation_id
             )
-        
-        elif message.message_type == "ping":
-            # Health check response
+            
+        except Exception as e:
             await self.send_message(
-                message.sender_id,
-                "pong", 
+                message.from_agent,
+                "research_error",
                 {
-                    "agent_type": self.agent_type,
-                    "status": "healthy",
-                    "capabilities": [
-                        "web_research",
-                        "academic_search", 
-                        "news_search",
-                        "document_extraction",
-                        "url_analysis"
-                    ]
+                    "task": message.payload,
+                    "error": str(e),
+                    "agent_id": self.agent_id
                 },
                 correlation_id=message.correlation_id
             )
+    
+    async def _handle_web_scrape(self, message: Message):
+        """Handle web scraping requests"""
+        url = message.payload.get("url")
+        options = message.payload.get("options", {})
         
+        if not url:
+            await self.send_message(
+                message.from_agent,
+                "scrape_error",
+                {"error": "No URL provided"},
+                correlation_id=message.correlation_id
+            )
+            return
+        
+        try:
+            result = await self._web_scrape(url, options)
+            
+            await self.send_message(
+                message.from_agent,
+                "scrape_result",
+                {
+                    "url": url,
+                    "result": result,
+                    "scraped_at": datetime.now(timezone.utc).isoformat()
+                },
+                correlation_id=message.correlation_id
+            )
+            
+        except Exception as e:
+            await self.send_message(
+                message.from_agent,
+                "scrape_error",
+                {
+                    "url": url,
+                    "error": str(e)
+                },
+                correlation_id=message.correlation_id
+            )
+    
+    async def _handle_arxiv_search(self, message: Message):
+        """Handle arXiv search requests"""
+        query = message.payload.get("query")
+        max_results = message.payload.get("max_results", 10)
+        
+        if not query:
+            await self.send_message(
+                message.from_agent,
+                "arxiv_error",
+                {"error": "No search query provided"},
+                correlation_id=message.correlation_id
+            )
+            return
+        
+        try:
+            result = await self._arxiv_search(query, max_results)
+            
+            await self.send_message(
+                message.from_agent,
+                "arxiv_result",
+                {
+                    "query": query,
+                    "papers": result,
+                    "searched_at": datetime.now(timezone.utc).isoformat()
+                },
+                correlation_id=message.correlation_id
+            )
+            
+        except Exception as e:
+            await self.send_message(
+                message.from_agent,
+                "arxiv_error",
+                {
+                    "query": query,
+                    "error": str(e)
+                },
+                correlation_id=message.correlation_id
+            )
+    
+    async def _handle_news_search(self, message: Message):
+        """Handle news search requests"""
+        query = message.payload.get("query")
+        options = message.payload.get("options", {})
+        
+        if not query:
+            await self.send_message(
+                message.from_agent,
+                "news_error",
+                {"error": "No search query provided"},
+                correlation_id=message.correlation_id
+            )
+            return
+        
+        try:
+            result = await self._news_search(query, options)
+            
+            await self.send_message(
+                message.from_agent,
+                "news_result",
+                {
+                    "query": query,
+                    "articles": result,
+                    "searched_at": datetime.now(timezone.utc).isoformat()
+                },
+                correlation_id=message.correlation_id
+            )
+            
+        except Exception as e:
+            await self.send_message(
+                message.from_agent,
+                "news_error",
+                {
+                    "query": query,
+                    "error": str(e)
+                },
+                correlation_id=message.correlation_id
+            )
+    
+    async def _handle_document_parse(self, message: Message):
+        """Handle document parsing requests"""
+        document_path = message.payload.get("document_path")
+        
+        if not document_path:
+            await self.send_message(
+                message.from_agent,
+                "parse_error",
+                {"error": "No document path provided"},
+                correlation_id=message.correlation_id
+            )
+            return
+        
+        try:
+            result = await self._parse_document(document_path)
+            
+            await self.send_message(
+                message.from_agent,
+                "parse_result",
+                {
+                    "document_path": document_path,
+                    "content": result,
+                    "parsed_at": datetime.now(timezone.utc).isoformat()
+                },
+                correlation_id=message.correlation_id
+            )
+            
+        except Exception as e:
+            await self.send_message(
+                message.from_agent,
+                "parse_error",
+                {
+                    "document_path": document_path,
+                    "error": str(e)
+                },
+                correlation_id=message.correlation_id
+            )
+    
+    async def _handle_url_extract(self, message: Message):
+        """Handle URL content extraction requests"""
+        urls = message.payload.get("urls", [])
+        
+        if not urls:
+            await self.send_message(
+                message.from_agent,
+                "extract_error",
+                {"error": "No URLs provided"},
+                correlation_id=message.correlation_id
+            )
+            return
+        
+        try:
+            result = await self._batch_url_extract(urls)
+            
+            await self.send_message(
+                message.from_agent,
+                "extract_result",
+                {
+                    "results": result,
+                    "extracted_at": datetime.now(timezone.utc).isoformat()
+                },
+                correlation_id=message.correlation_id
+            )
+            
+        except Exception as e:
+            await self.send_message(
+                message.from_agent,
+                "extract_error",
+                {
+                    "urls": urls,
+                    "error": str(e)
+                },
+                correlation_id=message.correlation_id
+            )
+    
+    # Core Research Methods
+    async def _web_scrape(self, url: str, options: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Scrape web content from a URL"""
+        options = options or {}
+        
+        # Check cache first
+        cache_key = self._get_cache_key(url, options)
+        cached_result = await self._get_from_cache(cache_key)
+        if cached_result:
+            self.stats["cache_hits"] += 1
+            return cached_result
+        
+        async with self.request_semaphore:
+            if PLAYWRIGHT_AVAILABLE and options.get("use_playwright", False):
+                result = await self._scrape_with_playwright(url, options)
+            else:
+                result = await self._scrape_with_requests(url, options)
+        
+        # Cache the result
+        await self._save_to_cache(cache_key, result)
+        return result
+    
+    async def _scrape_with_playwright(self, url: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Scrape using Playwright for JavaScript-heavy sites"""
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page()
+                
+                # Set viewport and user agent
+                await page.set_viewport_size({"width": 1920, "height": 1080})
+                
+                # Navigate to page
+                response = await page.goto(url, wait_until="networkidle")
+                
+                if not response or response.status >= 400:
+                    raise Exception(f"Failed to load page: HTTP {response.status if response else 'unknown'}")
+                
+                # Wait for specific selector if provided
+                if options.get("wait_for_selector"):
+                    await page.wait_for_selector(options["wait_for_selector"], timeout=10000)
+                
+                # Get content
+                content = await page.content()
+                title = await page.title()
+                
+                # Extract text content
+                text_content = await page.evaluate("""
+                    () => {
+                        // Remove script and style elements
+                        const scripts = document.querySelectorAll('script, style');
+                        scripts.forEach(el => el.remove());
+                        
+                        return document.body.innerText || document.body.textContent || '';
+                    }
+                """)
+                
+                return {
+                    "url": url,
+                    "title": title,
+                    "html_content": content,
+                    "text_content": text_content,
+                    "status_code": response.status,
+                    "method": "playwright",
+                    "scraped_at": datetime.now(timezone.utc).isoformat()
+                }
+                
+            finally:
+                await browser.close()
+    
+    async def _scrape_with_requests(self, url: str, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Scrape using aiohttp and BeautifulSoup"""
+        async with self.session.get(url) as response:
+            if response.status >= 400:
+                raise Exception(f"HTTP {response.status}: {response.reason}")
+            
+            content = await response.text()
+            
+            if BEAUTIFULSOUP_AVAILABLE:
+                soup = BeautifulSoup(content, 'html.parser')
+                
+                # Remove script and style elements
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                
+                title = soup.find('title')
+                title_text = title.get_text().strip() if title else ""
+                
+                text_content = soup.get_text()
+                # Clean up whitespace
+                lines = (line.strip() for line in text_content.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                text_content = ' '.join(chunk for chunk in chunks if chunk)
+                
+            else:
+                title_text = ""
+                text_content = content
+            
+            return {
+                "url": url,
+                "title": title_text,
+                "html_content": content,
+                "text_content": text_content,
+                "status_code": response.status,
+                "method": "aiohttp",
+                "scraped_at": datetime.now(timezone.utc).isoformat()
+            }
+    
+    async def _arxiv_search(self, query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+        """Search arXiv for academic papers"""
+        params = {
+            'search_query': query,
+            'max_results': max_results,
+            'sortBy': 'relevance',
+            'sortOrder': 'descending'
+        }
+        
+        async with self.session.get(self.config["arxiv_base_url"], params=params) as response:
+            if response.status >= 400:
+                raise Exception(f"arXiv API error: HTTP {response.status}")
+            
+            content = await response.text()
+            
+            papers = []
+            if BEAUTIFULSOUP_AVAILABLE:
+                soup = BeautifulSoup(content, 'xml')
+                
+                for entry in soup.find_all('entry'):
+                    paper = {
+                        'title': entry.find('title').get_text().strip() if entry.find('title') else "",
+                        'authors': [
+                            author.find('name').get_text().strip() 
+                            for author in entry.find_all('author')
+                            if author.find('name')
+                        ],
+                        'summary': entry.find('summary').get_text().strip() if entry.find('summary') else "",
+                        'published': entry.find('published').get_text().strip() if entry.find('published') else "",
+                        'updated': entry.find('updated').get_text().strip() if entry.find('updated') else "",
+                        'arxiv_id': entry.find('id').get_text().split('/')[-1] if entry.find('id') else "",
+                        'categories': [
+                            cat.get('term') for cat in entry.find_all('category')
+                            if cat.get('term')
+                        ],
+                        'pdf_url': None
+                    }
+                    
+                    # Find PDF link
+                    for link in entry.find_all('link'):
+                        if link.get('type') == 'application/pdf':
+                            paper['pdf_url'] = link.get('href')
+                            break
+                    
+                    papers.append(paper)
+            
+            return papers
+    
+    async def _news_search(self, query: str, options: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+        """Search for news articles using News API"""
+        if not self.config["news_api_key"]:
+            raise Exception("News API key not configured")
+        
+        options = options or {}
+        
+        params = {
+            'q': query,
+            'apiKey': self.config["news_api_key"],
+            'pageSize': options.get('max_results', 20),
+            'sortBy': options.get('sort_by', 'relevancy'),
+            'language': options.get('language', 'en')
+        }
+        
+        # Add date range if provided
+        if options.get('from_date'):
+            params['from'] = options['from_date']
+        if options.get('to_date'):
+            params['to'] = options['to_date']
+        
+        url = "https://newsapi.org/v2/everything"
+        
+        async with self.session.get(url, params=params) as response:
+            if response.status >= 400:
+                error_text = await response.text()
+                raise Exception(f"News API error: HTTP {response.status} - {error_text}")
+            
+            data = await response.json()
+            
+            if data['status'] != 'ok':
+                raise Exception(f"News API error: {data.get('message', 'Unknown error')}")
+            
+            articles = []
+            for article in data.get('articles', []):
+                articles.append({
+                    'title': article.get('title', ''),
+                    'description': article.get('description', ''),
+                    'content': article.get('content', ''),
+                    'url': article.get('url', ''),
+                    'source': article.get('source', {}).get('name', ''),
+                    'author': article.get('author', ''),
+                    'published_at': article.get('publishedAt', ''),
+                    'url_to_image': article.get('urlToImage', '')
+                })
+            
+            return articles
+    
+    async def _parse_document(self, document_path: str) -> Dict[str, Any]:
+        """Parse various document formats"""
+        file_path = Path(document_path)
+        
+        if not file_path.exists():
+            raise Exception(f"Document not found: {document_path}")
+        
+        file_extension = file_path.suffix.lower()
+        
+        if file_extension == '.pdf' and PDF_DOCX_AVAILABLE:
+            return await self._parse_pdf(file_path)
+        elif file_extension in ['.docx', '.doc'] and PDF_DOCX_AVAILABLE:
+            return await self._parse_docx(file_path)
+        elif file_extension in ['.txt', '.md']:
+            return await self._parse_text(file_path)
+        elif file_extension in ['.html', '.htm']:
+            return await self._parse_html(file_path)
+        elif file_extension == '.json':
+            return await self._parse_json(file_path)
         else:
-            self.logger.warning(f"Unknown message type: {message.message_type}")
+            raise Exception(f"Unsupported document format: {file_extension}")
+    
+    async def _parse_pdf(self, file_path: Path) -> Dict[str, Any]:
+        """Parse PDF document"""
+        text_content = ""
+        metadata = {}
+        
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                
+                # Extract metadata
+                if pdf_reader.metadata:
+                    metadata = {
+                        'title': pdf_reader.metadata.get('/Title', ''),
+                        'author': pdf_reader.metadata.get('/Author', ''),
+                        'subject': pdf_reader.metadata.get('/Subject', ''),
+                        'creator': pdf_reader.metadata.get('/Creator', ''),
+                        'producer': pdf_reader.metadata.get('/Producer', ''),
+                        'creation_date': str(pdf_reader.metadata.get('/CreationDate', '')),
+                        'modification_date': str(pdf_reader.metadata.get('/ModDate', ''))
+                    }
+                
+                # Extract text from all pages
+                for page_num, page in enumerate(pdf_reader.pages):
+                    try:
+                        page_text = page.extract_text()
+                        text_content += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                    except Exception as e:
+                        self.logger.warning(f"Failed to extract text from page {page_num + 1}: {e}")
+                
+        except Exception as e:
+            raise Exception(f"Failed to parse PDF: {e}")
+        
+        return {
+            'file_path': str(file_path),
+            'file_type': 'pdf',
+            'content': text_content.strip(),
+            'metadata': metadata,
+            'page_count': len(pdf_reader.pages) if 'pdf_reader' in locals() else 0,
+            'parsed_at': datetime.now(timezone.utc).isoformat()
+        }
+    
+    async def _parse_docx(self, file_path: Path) -> Dict[str, Any]:
+        """Parse DOCX document"""
+        try:
+            doc = docx.Document(file_path)
+            
+            # Extract text content
+            text_content = []
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    text_content.append(paragraph.text)
+            
+            # Extract metadata
+            metadata = {
+                'title': doc.core_properties.title or '',
+                'author': doc.core_properties.author or '',
+                'subject': doc.core_properties.subject or '',
+                'created': str(doc.core_properties.created) if doc.core_properties.created else '',
+                'modified': str(doc.core_properties.modified) if doc.core_properties.modified else '',
+                'last_modified_by': doc.core_properties.last_modified_by or ''
+            }
+            
+            return {
+                'file_path': str(file_path),
+                'file_type': 'docx',
+                'content': '\n'.join(text_content),
+                'metadata': metadata,
+                'paragraph_count': len([p for p in doc.paragraphs if p.text.strip()]),
+                'parsed_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+        except Exception as e:
+            raise Exception(f"Failed to parse DOCX: {e}")
+    
+    async def _parse_text(self, file_path: Path) -> Dict[str, Any]:
+        """Parse plain text document"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
+                content = await file.read()
+            
+            return {
+                'file_path': str(file_path),
+                'file_type': 'text',
+                'content': content,
+                'metadata': {
+                    'size_bytes': file_path.stat().st_size,
+                    'lines': len(content.splitlines()),
+                    'characters': len(content)
+                },
+                'parsed_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+        except Exception as e:
+            raise Exception(f"Failed to parse text file: {e}")
+    
+    async def _parse_html(self, file_path: Path) -> Dict[str, Any]:
+        """Parse HTML document"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
+                html_content = await file.read()
+            
+            text_content = html_content
+            title = ""
+            
+            if BEAUTIFULSOUP_AVAILABLE:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Remove script and style elements
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                
+                title_tag = soup.find('title')
+                title = title_tag.get_text().strip() if title_tag else ""
+                
+                text_content = soup.get_text()
+                # Clean up whitespace
+                lines = (line.strip() for line in text_content.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                text_content = ' '.join(chunk for chunk in chunks if chunk)
+            
+            return {
+                'file_path': str(file_path),
+                'file_type': 'html',
+                'content': text_content,
+                'html_content': html_content,
+                'metadata': {
+                    'title': title,
+                    'size_bytes': file_path.stat().st_size
+                },
+                'parsed_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+        except Exception as e:
+            raise Exception(f"Failed to parse HTML file: {e}")
+    
+    async def _parse_json(self, file_path: Path) -> Dict[str, Any]:
+        """Parse JSON document"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as file:
+                content = await file.read()
+            
+            json_data = json.loads(content)
+            
+            return {
+                'file_path': str(file_path),
+                'file_type': 'json',
+                'content': json.dumps(json_data, indent=2),
+                'json_data': json_data,
+                'metadata': {
+                    'size_bytes': file_path.stat().st_size,
+                    'keys': list(json_data.keys()) if isinstance(json_data, dict) else None,
+                    'items_count': len(json_data) if isinstance(json_data, (list, dict)) else None
+                },
+                'parsed_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+        except Exception as e:
+            raise Exception(f"Failed to parse JSON file: {e}")
+    
+    async def _batch_url_extract(self, urls: List[str]) -> List[Dict[str, Any]]:
+        """Extract content from multiple URLs concurrently"""
+        semaphore = asyncio.Semaphore(self.config["max_concurrent_requests"])
+        
+        async def extract_single_url(url: str) -> Dict[str, Any]:
+            async with semaphore:
+                try:
+                    result = await self._web_scrape(url)
+                    return {
+                        "url": url,
+                        "status": "success",
+                        "data": result
+                    }
+                except Exception as e:
+                    return {
+                        "url": url,
+                        "status": "error",
+                        "error": str(e)
+                    }
+        
+        # Execute all extractions concurrently
+        tasks = [extract_single_url(url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle any exceptions from gather
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                processed_results.append({
+                    "url": urls[i],
+                    "status": "error",
+                    "error": str(result)
+                })
+            else:
+                processed_results.append(result)
+        
+        return processed_results
+    
+    async def _create_research_summary(self, sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create a research summary from multiple sources"""
+        summary = {
+            "total_sources": len(sources),
+            "successful_sources": 0,
+            "failed_sources": 0,
+            "content_summary": {},
+            "key_findings": [],
+            "sources_by_type": {},
+            "generated_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        all_text = []
+        
+        for source in sources:
+            if source.get("status") == "success":
+                summary["successful_sources"] += 1
+                
+                source_type = source.get("type", "unknown")
+                if source_type not in summary["sources_by_type"]:
+                    summary["sources_by_type"][source_type] = 0
+                summary["sources_by_type"][source_type] += 1
+                
+                # Extract text content
+                data = source.get("data", {})
+                text = data.get("text_content") or data.get("content", "")
+                if text:
+                    all_text.append(text)
+            else:
+                summary["failed_sources"] += 1
+        
+        # Create basic content analysis
+        if all_text:
+            combined_text = " ".join(all_text)
+            summary["content_summary"] = {
+                "total_characters": len(combined_text),
+                "total_words": len(combined_text.split()),
+                "average_words_per_source": len(combined_text.split()) / len(all_text) if all_text else 0
+            }
+            
+            # Simple keyword extraction (most frequent words)
+            words = combined_text.lower().split()
+            word_freq = {}
+            for word in words:
+                if len(word) > 3:  # Skip short words
+                    word_freq[word] = word_freq.get(word, 0) + 1
+            
+            # Get top 10 most frequent words
+            top_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)[:10]
+            summary["key_findings"] = [{"word": word, "frequency": freq} for word, freq in top_words]
+        
+        return summary
+    
+    # Utility methods
+    def _get_cache_key(self, url: str, options: Dict[str, Any]) -> str:
+        """Generate cache key for URL and options"""
+        cache_string = f"{url}:{json.dumps(options, sort_keys=True)}"
+        return hashlib.md5(cache_string.encode()).hexdigest()
+    
+    async def _get_from_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Get result from cache if available and not expired"""
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        
+        if not cache_file.exists():
+            return None
+        
+        try:
+            # Check if cache is expired
+            file_age = datetime.now().timestamp() - cache_file.stat().st_mtime
+            if file_age > self.config["cache_duration"]:
+                cache_file.unlink()  # Remove expired cache
+                return None
+            
+            async with aiofiles.open(cache_file, 'r') as f:
+                content = await f.read()
+                return json.loads(content)
+                
+        except Exception as e:
+            self.logger.warning(f"Failed to read cache {cache_key}: {e}")
+            return None
+    
+    async def _save_to_cache(self, cache_key: str, data: Dict[str, Any]):
+        """Save result to cache"""
+        cache_file = self.cache_dir / f"{cache_key}.json"
+        
+        try:
+            async with aiofiles.open(cache_file, 'w') as f:
+                await f.write(json.dumps(data, indent=2, default=str))
+        except Exception as e:
+            self.logger.warning(f"Failed to save cache {cache_key}: {e}")
+    
+    async def clear_cache(self):
+        """Clear all cached results"""
+        try:
+            for cache_file in self.cache_dir.glob("*.json"):
+                cache_file.unlink()
+            self.logger.info("🧹 Research agent cache cleared")
+        except Exception as e:
+            self.logger.error(f"Failed to clear cache: {e}")
+    
+    async def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        try:
+            cache_files = list(self.cache_dir.glob("*.json"))
+            total_size = sum(f.stat().st_size for f in cache_files)
+            
+            return {
+                "cache_files": len(cache_files),
+                "total_size_bytes": total_size,
+                "total_size_mb": round(total_size / (1024 * 1024), 2),
+                "cache_directory": str(self.cache_dir),
+                "cache_hits": self.stats["cache_hits"]
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
-# Convenience function for creating research agent
-async def create_research_agent(agent_id: str = None) -> ResearchAgent:
-    """Create and initialize a research agent"""
-    agent = ResearchAgent(agent_id)
-    await agent.initialize()
-    await agent.initialize_browser()
-    return agent
+
+# Research Agent Factory
+def create_research_agent(agent_id: str = None) -> ResearchAgent:
+    """Create a new research agent instance"""
+    if agent_id is None:
+        agent_id = f"research_agent_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    
+    return ResearchAgent(agent_id)
+
+
+# Research Task Templates
+class ResearchTaskTemplates:
+    """Pre-defined research task templates"""
+    
+    @staticmethod
+    def web_scrape_task(url: str, use_playwright: bool = False) -> Dict[str, Any]:
+        """Template for web scraping task"""
+        return {
+            "type": "web_scrape",
+            "url": url,
+            "options": {
+                "use_playwright": use_playwright,
+                "wait_for_selector": None
+            }
+        }
+    
+    @staticmethod
+    def arxiv_search_task(query: str, max_results: int = 10) -> Dict[str, Any]:
+        """Template for arXiv search task"""
+        return {
+            "type": "arxiv_search",
+            "query": query,
+            "max_results": max_results
+        }
+    
+    @staticmethod
+    def news_search_task(
+        query: str, 
+        max_results: int = 20, 
+        language: str = "en",
+        sort_by: str = "relevancy"
+    ) -> Dict[str, Any]:
+        """Template for news search task"""
+        return {
+            "type": "news_search",
+            "query": query,
+            "options": {
+                "max_results": max_results,
+                "language": language,
+                "sort_by": sort_by
+            }
+        }
+    
+    @staticmethod
+    def document_parse_task(document_path: str) -> Dict[str, Any]:
+        """Template for document parsing task"""
+        return {
+            "type": "document_parse",
+            "document_path": document_path
+        }
+    
+    @staticmethod
+    def batch_url_extract_task(urls: List[str]) -> Dict[str, Any]:
+        """Template for batch URL extraction task"""
+        return {
+            "type": "url_batch_extract",
+            "urls": urls
+        }
+    
+    @staticmethod
+    def research_summary_task(sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Template for research summary task"""
+        return {
+            "type": "research_summary",
+            "sources": sources
+        }
