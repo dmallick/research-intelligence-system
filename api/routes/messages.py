@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 
 from core.message_queue import get_message_queue
-from agents.base.agent import AgentMessage
+#from agents.base.agent import AgentMessage
 
 router = APIRouter(prefix="/messages", tags=["messages"])
 

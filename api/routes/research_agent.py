@@ -7,7 +7,7 @@ from datetime import datetime
 
 from agents.research.research_agent import ResearchAgent, create_research_agent
 from core.message_queue import get_message_queue
-from agents.base.agent import AgentMessage
+#from agents.base.agent import AgentMessage
 
 router = APIRouter(prefix="/research-agent", tags=["research-agent"])
 

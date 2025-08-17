@@ -36,6 +36,7 @@ class TestCoordinatorAgent(BaseAgent):
         self.pending_requests = {}
         self.completed_tasks = []
         self.agent_responses = {}
+        self.started_at = datetime.now(timezone.utc)  # Add missing attribute
         
         # Register message handlers
         self._message_handlers.update({
@@ -43,6 +44,9 @@ class TestCoordinatorAgent(BaseAgent):
             "research_error": self._handle_research_error,
             "agent_status_response": self._handle_status_response,
             "task_completed": self._handle_task_completed,
+            "status_response": self._handle_status_response,  # Add alternative handler
+            "task_result": self._handle_research_result,  # Add alternative handler
+            "task_error": self._handle_research_error,    # Add alternative handler
         })
     
     async def initialize(self):
@@ -174,6 +178,33 @@ class TestCoordinatorAgent(BaseAgent):
     async def _handle_task_completed(self, message: Message):
         """Handle task completion notifications"""
         self.logger.info(f"✅ Task completed by {message.from_agent}: {message.payload}")
+    
+    async def get_status(self) -> Dict[str, Any]:
+        """Get coordinator agent status (required by BaseAgent)"""
+        uptime = datetime.now(timezone.utc) - self.started_at
+        
+        return {
+            "agent_type": self.agent_type,
+            "capabilities": {
+                "coordination": True,
+                "research_delegation": True,
+                "health_checking": True,
+                "concurrent_tasks": True
+            },
+            "statistics": {
+                "pending_requests": len(self.pending_requests),
+                "completed_tasks": len(self.completed_tasks),
+                "total_responses": len(self.agent_responses),
+                "uptime_seconds": uptime.total_seconds(),
+                "success_rate": (
+                    len(self.completed_tasks) / max(len(self.completed_tasks) + len(self.pending_requests), 1)
+                ) * 100
+            },
+            "configuration": {
+                "max_timeout": 30,
+                "health_check_timeout": 10
+            }
+        }
     
     async def get_statistics(self) -> Dict[str, Any]:
         """Get coordinator statistics"""
