@@ -143,3 +143,41 @@ class BaseAgent(ABC):
         """Save task result"""
         # Implement result saving logic
         pass
+
+    # Add this method to your BaseAgent class in agents/base/agent.py
+
+async def _register_agent_safe(self):
+    """Register agent with duplicate handling"""
+    try:
+        async with AsyncSession(engine) as session:
+            # Check if agent already exists
+            result = await session.execute(
+                select(AgentState).where(AgentState.agent_id == self.agent_id)
+            )
+            existing_agent = result.scalar_one_or_none()
+            
+            if existing_agent:
+                # Update existing agent
+                existing_agent.status = "active"
+                existing_agent.last_heartbeat = datetime.utcnow()
+                existing_agent.agent_metadata = {}
+                self.logger.info(f"Updated existing agent registration: {self.agent_id}")
+            else:
+                # Create new agent
+                agent_state = AgentState(
+                    agent_id=self.agent_id,
+                    agent_type=self.agent_type,
+                    status="active",
+                    last_heartbeat=datetime.utcnow(),
+                    agent_metadata={}
+                )
+                session.add(agent_state)
+                self.logger.info(f"Created new agent registration: {self.agent_id}")
+            
+            await session.commit()
+            
+    except Exception as e:
+        self.logger.error(f"Failed to register agent {self.agent_id}: {e}")
+        # Don't raise exception, allow agent to continue
+        
+# Replace the _register_agent call in the initialize method with _register_agent_safe

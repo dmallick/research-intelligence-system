@@ -73,3 +73,4 @@ python-magic
 
 # Agent Development
 #arxiv
+#feedparser
