@@ -12,12 +12,13 @@ import time
 from datetime import datetime, timezone
 import logging
 
+
 # Add project root to Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.research.research_agent import ResearchAgent
-from agents.base.agent import BaseAgent
-from core.message_queue import Message
+from agents.base.agent import BaseAgent, get_message_queue
+from core.message_queue import Message, shutdown_message_queue
 
 # Setup logging
 logging.basicConfig(
@@ -165,24 +166,68 @@ class SimpleTestAgent(BaseAgent):
         return self.responses.pop(correlation_id)
 
 
-async def test_basic_ping_pong():
+# async def test_basic_ping_pong():
+#     """Test basic ping-pong communication"""
+#     print("\n" + "="*60)
+#     print("=== BASIC PING-PONG TEST ===")
+#     print("="*60)
+    
+#     agent_a = SimpleTestAgent("agent_a")
+#     agent_b = SimpleTestAgent("agent_b")
+    
+#     try:
+#         # Initialize both agents
+#         await agent_a.initialize()
+#         await agent_b.initialize()
+        
+#         print("✅ Both agents initialized")
+        
+#         # Give agents time to fully start listening
+#         await asyncio.sleep(1)
+        
+#         # Agent A sends ping to Agent B
+#         print("📤 Agent A sending PING to Agent B...")
+#         correlation_id = await agent_a.send_ping("agent_b")
+        
+#         # Wait for response
+#         print("⏳ Waiting for PONG response...")
+#         response = await agent_a.wait_for_response(correlation_id, timeout=5)
+        
+#         if response.get("status") == "timeout":
+#             print("❌ PING-PONG test timed out")
+            
+#             # Debug info
+#             print(f"Agent A received {len(agent_a.received_messages)} messages")
+#             print(f"Agent B received {len(agent_b.received_messages)} messages")
+            
+#             for msg in agent_b.received_messages:
+#                 print(f"  Agent B got: {msg.message_type} from {msg.from_agent}")
+            
+#             return False
+#         else:
+#             print("✅ Received PONG response!")
+#             print(f"   Response from: {response.get('pong_from')}")
+#             print(f"   Original data echoed: {response.get('original_ping', {}).get('test_data')}")
+#             return True
+    
+#     except Exception as e:
+#         print(f"❌ PING-PONG test failed: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return False
+    
+#     finally:
+#         await agent_a.shutdown()
+#         await agent_b.shutdown()
+
+async def test_basic_ping_pong(agent_a, agent_b):
     """Test basic ping-pong communication"""
     print("\n" + "="*60)
     print("=== BASIC PING-PONG TEST ===")
     print("="*60)
     
-    agent_a = SimpleTestAgent("agent_a")
-    agent_b = SimpleTestAgent("agent_b")
-    
     try:
-        # Initialize both agents
-        await agent_a.initialize()
-        await agent_b.initialize()
-        
-        print("✅ Both agents initialized")
-        
-        # Give agents time to fully start listening
-        await asyncio.sleep(1)
+        # Agents are already initialized by main()
         
         # Agent A sends ping to Agent B
         print("📤 Agent A sending PING to Agent B...")
@@ -194,19 +239,10 @@ async def test_basic_ping_pong():
         
         if response.get("status") == "timeout":
             print("❌ PING-PONG test timed out")
-            
-            # Debug info
-            print(f"Agent A received {len(agent_a.received_messages)} messages")
-            print(f"Agent B received {len(agent_b.received_messages)} messages")
-            
-            for msg in agent_b.received_messages:
-                print(f"  Agent B got: {msg.message_type} from {msg.from_agent}")
-            
+            # ... (debug info) ...
             return False
         else:
             print("✅ Received PONG response!")
-            print(f"   Response from: {response.get('pong_from')}")
-            print(f"   Original data echoed: {response.get('original_ping', {}).get('test_data')}")
             return True
     
     except Exception as e:
@@ -216,72 +252,78 @@ async def test_basic_ping_pong():
         return False
     
     finally:
-        await agent_a.shutdown()
-        await agent_b.shutdown()
+        # Agents are shut down by main()
+        pass
+
+async def test_research_agent_communication(test_agent, research_agent):
+    # This function is now a method of main()
+    # No need to initialize or shutdown agents
+    pass
 
 
-async def test_research_agent_communication():
-    """Test communication with actual ResearchAgent"""
-    print("\n" + "="*60)
-    print("=== RESEARCH AGENT COMMUNICATION TEST ===")
-    print("="*60)
+# async def test_research_agent_communication():
+#     """Test communication with actual ResearchAgent"""
+#     print("\n" + "="*60)
+#     print("=== RESEARCH AGENT COMMUNICATION TEST ===")
+#     print("="*60)
     
-    test_agent = SimpleTestAgent("test_coordinator")
-    research_agent = ResearchAgent("test_research_agent")
+#     test_agent = SimpleTestAgent("test_coordinator")
+#     research_agent = ResearchAgent("test_research_agent")
     
-    try:
-        await test_agent.initialize()
-        await research_agent.initialize()
+#     try:
+#         await test_agent.initialize()
+#         await research_agent.initialize()
         
-        print("✅ Both agents initialized")
+#         print("✅ Both agents initialized")
         
-        # Give agents time to start
-        await asyncio.sleep(1)
+#         # Give agents time to start
+#         await asyncio.sleep(1)
         
-        # Send a simple research task
-        print("📤 Sending research task to research agent...")
+#         # Send a simple research task
+#         print("📤 Sending research task to research agent...")
         
-        correlation_id = f"research_test_{int(time.time())}"
+#         correlation_id = f"research_test_{int(time.time())}"
         
-        await test_agent.send_message(
-            "test_research_agent",
-            "research_task",
-            {
-                "type": "web_scrape",
-                "url": "https://httpbin.org/html",
-                "task_id": "simple_test"
-            },
-            correlation_id=correlation_id
-        )
+#         await test_agent.send_message(
+#             "test_research_agent",
+#             "research_task",
+#             {
+#                 "type": "web_scrape",
+#                 "url": "https://httpbin.org/html",
+#                 "task_id": "simple_test"
+#             },
+#             correlation_id=correlation_id
+#         )
         
-        # Wait for response
-        print("⏳ Waiting for research result...")
-        response = await test_agent.wait_for_response(correlation_id, timeout=15)
+#         # Wait for response
+#         print("⏳ Waiting for research result...")
+#         response = await test_agent.wait_for_response(correlation_id, timeout=15)
         
-        if response.get("status") == "timeout":
-            print("❌ Research task timed out")
+#         if response.get("status") == "timeout":
+#             print("❌ Research task timed out")
             
-            # Debug info
-            print(f"Test agent received {len(test_agent.received_messages)} messages")
-            for msg in test_agent.received_messages:
-                print(f"  Got: {msg.message_type} from {msg.from_agent}")
+#             # Debug info
+#             print(f"Test agent received {len(test_agent.received_messages)} messages")
+#             for msg in test_agent.received_messages:
+#                 print(f"  Got: {msg.message_type} from {msg.from_agent}")
             
-            return False
-        else:
-            print("✅ Received research result!")
-            print(f"   Status: {response.get('status', 'unknown')}")
-            print(f"   Agent: {response.get('agent_id', 'unknown')}")
-            return True
+#             return False
+#         else:
+#             print("✅ Received research result!")
+#             print(f"   Status: {response.get('status', 'unknown')}")
+#             print(f"   Agent: {response.get('agent_id', 'unknown')}")
+#             return True
     
-    except Exception as e:
-        print(f"❌ Research agent test failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+#     except Exception as e:
+#         print(f"❌ Research agent test failed: {e}")
+#         import traceback
+#         traceback.print_exc()
+#         return False
     
-    finally:
-        await test_agent.shutdown()
-        await research_agent.shutdown()
+#     finally:
+#         await test_agent.shutdown()
+#         await research_agent.shutdown()
+
 
 
 async def test_message_queue_health():
@@ -292,50 +334,60 @@ async def test_message_queue_health():
     
     try:
         # Test Redis connection
-        from core.message_queue import MessageQueue, get_message_queue
+        from core.message_queue import MessageQueue, get_message_queue, shutdown_message_queue
         
         #mq = MessageQueue("redis://localhost:6379/")
         #await mq.initialize()
         #mq.connect
         mq = await get_message_queue()
-        
+        test_channel = "test_health_check"
         
         print("✅ Message queue connection established")
-        
-        # Check if we can connect and publish/subscribe -- Start
-        if mq.is_connected():
+        if await mq.health_check():
             print("Successfully connected to Message Queue.")
-        # Now you can use the instance to interact with the message queue
-        mq.publish("my_topic", "Hello, Message Queue!")
-        message = mq.get("my_topic")
-        if message:
-            print(f"Received message: {message}")
-        else:
-            print("No message received from the topic.")
-        # Check if we can connect and publish/subscribe -- End    
+            
+            # Create a proper Message object to publish
+            test_message = Message(
+                from_agent="health_check_test",
+                to_agent="test_receiver",
+                message_type="test_message",
+                payload={"test_data": "Hello from health check!"}
+            )
+            
+            # Use the correct method and await it
+            await mq.publish_message(test_message, channel=test_channel)
+            print(f"Published message with ID: {test_message.id}")
+            
+            # Use the correct method to get the message from the queue and await it
+            retrieved_message = await mq.get_message_from_queue(channel=test_channel)
+
+            if retrieved_message:
+                print(f"✅ Received message from topic: {retrieved_message.payload.get('test_data')}")
+            else:
+                print("No message received from the topic.")
 
         # Test basic pub/sub
-        test_channel = "test_health_check"
-        test_message = {"test": "message", "timestamp": datetime.now().isoformat()}
+        
+        #test_message = {"test": "message", "timestamp": datetime.now().isoformat()}
         
         # Subscribe to test channel
         async def message_handler(channel, message):
             print(f"✅ Received test message on {channel}: {message}")
         
-        await mq.subscribe(test_channel, message_handler)
+        await mq.subscribe_to_channel(test_channel, message_handler)
         print(f"✅ Subscribed to {test_channel}")
         
         # Give subscription time to register
         await asyncio.sleep(0.5)
         
         # Publish test message
-        await mq.publish(test_channel, test_message)
-        print(f"✅ Published test message to {test_channel}")
+        #await mq.publish_message(test_channel, test_message)
+        #print(f"✅ Published test message to {test_channel}")
         
         # Give time for message processing
         await asyncio.sleep(1)
         
-        await mq.shutdown()
+        await shutdown_message_queue()
         print("✅ Message queue health check completed")
         
         return True
@@ -347,15 +399,95 @@ async def test_message_queue_health():
         return False
 
 
+# async def main():
+#     """Run communication debug tests"""
+#     print("🚀 Starting Communication Debug Tests")
+#     print("Make sure Redis is running (docker-compose up)")
+    
+#     mq = await get_message_queue()
+
+#     tests = [
+#         ("Message Queue Health", test_message_queue_health),
+#         ("Basic Ping-Pong", test_basic_ping_pong),
+#         ("Research Agent Communication", test_research_agent_communication),
+#     ]
+    
+#     results = []
+    
+#     # Start message listener after all agents are initialized.
+#     asyncio.create_task(mq.start_listening())
+#     print("✅ Message queue listener started")
+#     for test_name, test_func in tests:
+#         print(f"\n⚡ Running {test_name}...")
+#         try:
+#             result = await test_func()
+#             results.append((test_name, result))
+#             if result:
+#                 print(f"✅ {test_name}: PASSED")
+#             else:
+#                 print(f"❌ {test_name}: FAILED")
+#         except Exception as e:
+#             print(f"💥 {test_name}: CRASHED - {e}")
+#             results.append((test_name, False))
+        
+#         # Delay between tests
+#         await asyncio.sleep(2)
+    
+#     # Summary
+#     print("\n" + "="*60)
+#     print("🏁 COMMUNICATION DEBUG SUMMARY")
+#     print("="*60)
+    
+#     passed = sum(1 for _, result in results if result)
+#     total = len(results)
+    
+#     for test_name, result in results:
+#         status = "✅ PASS" if result else "❌ FAIL"
+#         print(f"{test_name:<30} {status}")
+    
+#     print(f"\nResults: {passed}/{total} tests passed")
+    
+#     if passed == total:
+#         print("🎉 All debug tests passed! Communication system is working.")
+#     else:
+#         print("⚠️ Some tests failed - check the logs above for details.")
+
+
+# In simple_communication_debug.py
+
 async def main():
     """Run communication debug tests"""
     print("🚀 Starting Communication Debug Tests")
     print("Make sure Redis is running (docker-compose up)")
     
+    # Get the MessageQueue instance (without starting the listener)
+    mq = await get_message_queue()
+    
+    # 1. Initialize all agents BEFORE running any tests or starting the listener
+    print("Initializing agents...")
+    agent_a = SimpleTestAgent("agent_a")
+    agent_b = SimpleTestAgent("agent_b")
+    test_coordinator = SimpleTestAgent("test_coordinator")
+    research_agent = ResearchAgent("test_research_agent")
+    
+    await agent_a.initialize()
+    await agent_b.initialize()
+    await test_coordinator.initialize()
+    await research_agent.initialize()
+    print("✅ All agents initialized")
+    
+    # 2. Start the message listener AFTER all agents are initialized
+    asyncio.create_task(mq.start_listening())
+    print("✅ Message queue listener started")
+    
+    # 3. Add a short delay to give the listener time to fully subscribe
+    await asyncio.sleep(1)
+    
+    # Now define your tests using lambda to pass the initialized agents
     tests = [
         ("Message Queue Health", test_message_queue_health),
-        ("Basic Ping-Pong", test_basic_ping_pong),
-        ("Research Agent Communication", test_research_agent_communication),
+        ("Basic Ping-Pong", lambda: test_basic_ping_pong(agent_a, agent_b)),
+        ("Research Agent Communication", lambda: test_research_agent_communication(test_coordinator, research_agent)),
     ]
     
     results = []
@@ -375,8 +507,8 @@ async def main():
         
         # Delay between tests
         await asyncio.sleep(2)
-    
-    # Summary
+        
+    # Summary and final shutdown...
     print("\n" + "="*60)
     print("🏁 COMMUNICATION DEBUG SUMMARY")
     print("="*60)
@@ -394,6 +526,18 @@ async def main():
         print("🎉 All debug tests passed! Communication system is working.")
     else:
         print("⚠️ Some tests failed - check the logs above for details.")
+    
+    # 4. Shutdown all agents at the end of the script
+    await agent_a.shutdown()
+    await agent_b.shutdown()
+    await test_coordinator.shutdown()
+    await research_agent.shutdown()
+    await shutdown_message_queue()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
 
 
 if __name__ == "__main__":

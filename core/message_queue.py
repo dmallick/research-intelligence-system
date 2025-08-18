@@ -383,6 +383,8 @@ class MessageQueue:
 _message_queue: Optional[MessageQueue] = None
 
 
+
+
 async def get_message_queue() -> MessageQueue:
     """Get or create the global message queue instance"""
     global _message_queue
@@ -390,14 +392,8 @@ async def get_message_queue() -> MessageQueue:
     if _message_queue is None:
         _message_queue = MessageQueue()
         await _message_queue.connect()
-        
-        # Start the message listener
-        asyncio.create_task(_message_queue.start_listening())
-        
-        logger.info("📡 Message queue initialized and listening")
     
     return _message_queue
-
 
 async def shutdown_message_queue():
     """Shutdown the global message queue"""
@@ -408,3 +404,4 @@ async def shutdown_message_queue():
         await _message_queue.disconnect()
         _message_queue = None
         logger.info("📡 Message queue shutdown complete")
+
